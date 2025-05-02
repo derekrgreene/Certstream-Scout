@@ -6,7 +6,7 @@ This tool opens a websocket connection to [Certstream Server Go](https://github.
 
 ## 📋 Features
 
-- Real-time monitoring of Certificate Transparency logs
+- Real-time aggregating of Certificate Transparency logs
 - DNS lookups (A, AAAA, MX, TXT, CAA, SOA records)
 - Domain WHOIS lookups
 - IP WHOIS lookups for discovered A records
