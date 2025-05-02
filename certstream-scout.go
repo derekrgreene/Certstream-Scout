@@ -24,8 +24,7 @@ const (
 	numWorkers        = 500 // Number of worker goroutines for DNS/WHOIS resolution
 	dnsTimeout        = 5 * time.Second
 	outputDir         = "ctlog_data"
-	channelBufferSize = 10000          // Buffer for high throughput
-	cacheTTL          = 24 * time.Hour // Time to keep domains in cache (avoid duplicates)
+	channelBufferSize = 10000 // Buffer for high throughput
 )
 
 // Default values, can be overridden by cli flags
@@ -36,6 +35,7 @@ var (
 	streamName    = "CERTSTREAM"
 	subjectName   = "certstream.domains"
 	consumerGroup = "domain-processors"
+	cacheTTL      = 24 * time.Hour // Time to keep domains in cache (avoid duplicates)
 	// Domain cache with default expiration of 24 hours, cleanup every hour
 	domainCache = cache.New(cacheTTL, 1*time.Hour)
 )
