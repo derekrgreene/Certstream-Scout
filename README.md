@@ -1,7 +1,6 @@
 # 🔍 Certificate Scout
 
 This tool opens a websocket connection to [Certstream Server Go](https://github.com/d-Rickyy-b/certstream-server-go) server, extracts domains from the stream of certificate transparency logs, and performs DNS A/AAAA, CAA, TXT, MX, SOA, and both IP and domain WHOIS lookups. Results are stored in JSON format and saved to the directory /ctlog_data.
-# 🔍 Certificate Scout
 
 ---
 
