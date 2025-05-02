@@ -38,6 +38,7 @@ var (
 	cacheTTL      = 24 * time.Hour // Time to keep domains in cache (avoid duplicates)
 	// Domain cache with default expiration of 24 hours, cleanup every hour
 	domainCache = cache.New(cacheTTL, 1*time.Hour)
+	cacheMutex  = &sync.Mutex{} // Mutex to avoid race conditions on the cache
 )
 
 // DomainEntry represents the domain information from certstreams /domain-only endpoint
@@ -112,7 +113,7 @@ func certstreamClient(ctx context.Context, js nats.JetStreamContext) error {
 			// Track normalized domains to avoid duplicates within the same certificate
 			processedDomains := make(map[string]struct{})
 
-			// Send each domain to NATS (if not already processed recently)
+			// Send each domain to NATS
 			for _, domain := range entry.Data {
 				normalizedDomain := normalizeDomain(domain)
 				// Skip if empty after normalization
@@ -129,14 +130,17 @@ func certstreamClient(ctx context.Context, js nats.JetStreamContext) error {
 				processedDomains[normalizedDomain] = struct{}{}
 
 				// Check if domain is already in cache (processed within cacheTTL)
+				// Use mutex to avoid race conditions
+				cacheMutex.Lock()
 				_, found := domainCache.Get(normalizedDomain)
 				if found {
 					log.Printf("Skipping recently seen domain: %s", normalizedDomain)
+					cacheMutex.Unlock()
 					continue
 				}
-
-				// Add domain to cache to prevent reprocessing
-				domainCache.Set(normalizedDomain, true, cache.DefaultExpiration)
+				// IMPORTANT FIX: We now DON'T add the domain to cache here
+				// We'll let the worker add it to cache after successful processing
+				cacheMutex.Unlock()
 
 				// Publish to NATS
 				_, err := js.Publish(subjectName, []byte(normalizedDomain))
@@ -144,6 +148,7 @@ func certstreamClient(ctx context.Context, js nats.JetStreamContext) error {
 					log.Printf("Error publishing to NATS: %v", err)
 					continue
 				}
+				log.Printf("Published domain to NATS: %s", normalizedDomain)
 			}
 		}
 	}
@@ -190,16 +195,22 @@ func dnsResolver(ctx context.Context, workerID int, js nats.JetStreamContext, re
 			for _, msg := range msgs {
 				domain := string(msg.Data)
 
-				// Double-check that domain is still not in cache
-				// This is a safeguard in case of race conditions between workers
+				// Check if domain is already in cache with mutex lock
+				cacheMutex.Lock()
 				_, found := domainCache.Get(domain)
 				if found {
+					cacheMutex.Unlock()
 					log.Printf("Worker %d skipping already processed domain: %s", workerID, domain)
 					if err := msg.Ack(); err != nil {
 						log.Printf("Worker %d error acknowledging skipped message: %v", workerID, err)
 					}
 					continue
 				}
+
+				// Mark the domain as being processed to prevent other workers from processing it
+				// This is a critical fix - we add to cache BEFORE processing, not after
+				domainCache.Set(domain, true, cache.DefaultExpiration)
+				cacheMutex.Unlock()
 
 				log.Printf("Worker %d processing domain: %s", workerID, domain)
 
@@ -272,6 +283,7 @@ func dnsResolver(ctx context.Context, workerID int, js nats.JetStreamContext, re
 					if err := msg.Ack(); err != nil {
 						log.Printf("Worker %d error acknowledging message: %v", workerID, err)
 					}
+					log.Printf("Worker %d successfully processed domain: %s", workerID, domain)
 				case <-ctx.Done():
 					return nil
 				default:
@@ -433,6 +445,7 @@ func resultSaver(ctx context.Context, resultChan <-chan DomainInfo) error {
 				log.Printf("Error writing result to file: %v", err)
 				continue
 			}
+			log.Printf("Saved result to file: %s", filename)
 		}
 	}
 }
