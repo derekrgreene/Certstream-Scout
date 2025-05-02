@@ -9,7 +9,7 @@ require (
 	github.com/nats-io/nats.go v1.31.0
 	github.com/patrickmn/go-cache v2.1.0+incompatible
 	golang.org/x/net v0.35.0
-
+	golang.org/x/time v0.5.0
 )
 
 require (

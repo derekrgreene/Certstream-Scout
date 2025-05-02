@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"os/signal"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/patrickmn/go-cache"
 	"golang.org/x/net/publicsuffix" // Public suffix list for proper domain extraction
+	"golang.org/x/time/rate"        // Import the rate package for rate limiting
 )
 
 const (
@@ -40,6 +42,14 @@ var (
 	// Domain cache with default expiration of 24 hours, cleanup every hour
 	domainCache = cache.New(cacheTTL, 1*time.Hour)
 	cacheMutex  = &sync.Mutex{} // Mutex to avoid race conditions on the cache
+
+	// Rate limiters for WHOIS queries
+	domainWhoisLimiter = rate.NewLimiter(rate.Every(5*time.Second), 1)  // 1 query per 5 seconds
+	ipWhoisLimiter     = rate.NewLimiter(rate.Every(10*time.Second), 1) // 1 query per 10 seconds
+
+	// WHOIS cache with longer expiration (1 week)
+	whoisCache      = cache.New(7*24*time.Hour, 1*time.Hour) // WHOIS results cache
+	whoisCacheMutex = &sync.Mutex{}                          // Mutex for WHOIS cache
 )
 
 // DomainEntry represents the domain information from certstreams /domain-only endpoint
@@ -85,6 +95,81 @@ func normalizeDomain(domain string) string {
 	domain = strings.TrimPrefix(domain, "www.")
 	domain = strings.TrimPrefix(domain, "*.")
 	return domain
+}
+
+// retryWhois performs WHOIS query with rate limiting and exponential backoff
+func retryWhois(domain string, isIP bool, maxRetries int) (string, error) {
+	var whoisResult string
+	var err error
+	var limiter *rate.Limiter
+
+	if isIP {
+		limiter = ipWhoisLimiter
+	} else {
+		limiter = domainWhoisLimiter
+	}
+
+	// Initial backoff time
+	backoff := 5 * time.Second
+
+	for retries := 0; retries <= maxRetries; retries++ {
+		// Wait for rate limiter permission
+		if err := limiter.Wait(context.Background()); err != nil {
+			return "", fmt.Errorf("rate limiter error: %w", err)
+		}
+
+		// Perform WHOIS query
+		whoisResult, err = whois.Whois(domain)
+
+		// If successful or not a rate limit error, return the result
+		if err == nil || !strings.Contains(strings.ToLower(err.Error()), "rate limit") {
+			return whoisResult, err
+		}
+
+		// If we hit rate limit, add jitter to backoff
+		jitter := time.Duration(rand.Int63n(int64(backoff) / 2))
+		sleepTime := backoff + jitter
+
+		log.Printf("WHOIS rate limit hit for %s, retrying in %v (retry %d/%d)",
+			domain, sleepTime, retries+1, maxRetries)
+
+		// Sleep before retry
+		time.Sleep(sleepTime)
+
+		// Exponential backoff
+		backoff *= 2
+	}
+
+	return "", fmt.Errorf("exceeded maximum retries for WHOIS query: %w", err)
+}
+
+// getWhoisWithCache fetches WHOIS info from cache or performs lookup with rate limiting
+func getWhoisWithCache(domain string, isIP bool, maxRetries int) (string, error) {
+	// Check cache first
+	whoisCacheMutex.Lock()
+	cacheKey := domain
+	if isIP {
+		cacheKey = "ip:" + domain // Prefix to distinguish from domain lookups
+	}
+
+	if result, found := whoisCache.Get(cacheKey); found {
+		whoisCacheMutex.Unlock()
+		return result.(string), nil
+	}
+	whoisCacheMutex.Unlock()
+
+	// Not in cache, perform lookup
+	result, err := retryWhois(domain, isIP, maxRetries)
+	if err != nil {
+		return "", err
+	}
+
+	// Add to cache
+	whoisCacheMutex.Lock()
+	whoisCache.Set(cacheKey, result, cache.DefaultExpiration)
+	whoisCacheMutex.Unlock()
+
+	return result, nil
 }
 
 // certstreamClient connects to the certstream server and publishes domains to NATS message broker
@@ -289,7 +374,9 @@ func dnsResolver(ctx context.Context, workerID int, js nats.JetStreamContext, re
 				// Perform domain WHOIS lookup on the root domain instead of the subdomain
 				log.Printf("Worker %d performing WHOIS lookup on root domain %s instead of full domain %s",
 					workerID, rootDomain, domain)
-				domainWhois, err := whois.Whois(rootDomain)
+
+				// Use the rate-limited and cached WHOIS lookup
+				domainWhois, err := getWhoisWithCache(rootDomain, false, 3) // 3 retries max
 				if err == nil {
 					info.DomainWhois = domainWhois
 					log.Printf("Worker %d successfully retrieved WHOIS data for root domain %s", workerID, rootDomain)
@@ -297,9 +384,9 @@ func dnsResolver(ctx context.Context, workerID int, js nats.JetStreamContext, re
 					log.Printf("Worker %d error performing WHOIS for root domain %s: %v", workerID, rootDomain, err)
 				}
 
-				// Perform IP WHOIS lookups for each A record
+				// Perform IP WHOIS lookups for each A record with rate limiting
 				for _, ip := range info.A {
-					ipWhois, err := whois.Whois(ip)
+					ipWhois, err := getWhoisWithCache(ip, true, 2) // 2 retries max for IP WHOIS
 					if err == nil {
 						info.IPWhois[ip] = ipWhois
 					} else {
@@ -488,6 +575,12 @@ func main() {
 	workersFlag := flag.Int("workers", numWorkers, "Number of worker goroutines")
 	natsURLFlag := flag.String("nats", natsURL, "NATS server URL")
 	cacheTTLFlag := flag.Duration("cache-ttl", cacheTTL, "Time to keep domains in cache (to avoid duplicates)")
+
+	// WHOIS rate limiting flags
+	domainWhoisRateFlag := flag.Duration("domain-whois-rate", 5*time.Second, "Time between domain WHOIS queries")
+	ipWhoisRateFlag := flag.Duration("ip-whois-rate", 10*time.Second, "Time between IP WHOIS queries")
+	whoisCacheTTLFlag := flag.Duration("whois-cache-ttl", 7*24*time.Hour, "Time to keep WHOIS results in cache")
+
 	flag.Parse()
 
 	// Update vars based on flags
@@ -509,10 +602,32 @@ func main() {
 		domainCache = cache.New(cacheTTL, 1*time.Hour)
 	}
 
+	// Update WHOIS rate limiters if specified
+	if *domainWhoisRateFlag != 5*time.Second {
+		domainWhoisLimiter = rate.NewLimiter(rate.Every(*domainWhoisRateFlag), 1)
+		log.Printf("Domain WHOIS rate set to one query per %s", *domainWhoisRateFlag)
+	}
+	if *ipWhoisRateFlag != 10*time.Second {
+		ipWhoisLimiter = rate.NewLimiter(rate.Every(*ipWhoisRateFlag), 1)
+		log.Printf("IP WHOIS rate set to one query per %s", *ipWhoisRateFlag)
+	}
+
+	// Update WHOIS cache TTL if specified
+	if *whoisCacheTTLFlag != 7*24*time.Hour {
+		whoisCache = cache.New(*whoisCacheTTLFlag, 1*time.Hour)
+		log.Printf("WHOIS cache TTL set to %s", *whoisCacheTTLFlag)
+	}
+
 	log.Printf("Starting real-time domain analyzer with certstream at %s", certstreamURL)
 	log.Printf("Using NATS server at %s", natsURL)
 	log.Printf("Using %d worker goroutines", numWorkers)
 	log.Printf("Domain cache TTL set to %s", cacheTTL)
+	log.Printf("Domain WHOIS rate limit: 1 query per %s", domainWhoisLimiter.Limit())
+	log.Printf("IP WHOIS rate limit: 1 query per %s", ipWhoisLimiter.Limit())
+	log.Printf("WHOIS cache TTL set to %s", *whoisCacheTTLFlag)
+
+	// Initialize random seed for jitter
+	rand.Seed(time.Now().UnixNano())
 
 	// Connect to NATS
 	nc, err := nats.Connect(natsURL)
@@ -580,7 +695,7 @@ func main() {
 	// Start DNS resolvers/workers
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
-		i := i // Capture loop variable
+		i := i
 		go func() {
 			defer wg.Done()
 			if err := dnsResolver(ctx, i, js, resultChan); err != nil {
