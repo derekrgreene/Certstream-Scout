@@ -1,0 +1,17 @@
+# Binaries
+certstream-scout
+
+# Application results dir
+/ctlog_data/
+
+# Log files
+*.log
+
+# Environment variables
+.env
+
+# OS specific files
+.DS_Store
+
+# IDE specific
+.vscode/
