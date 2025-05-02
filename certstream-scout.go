@@ -68,6 +68,20 @@ func normalizeDomain(domain string) string {
 	return domain
 }
 
+// extractRootDomain extracts the registrable domain for WHOIS queries
+func extractRootDomain(domain string) string {
+	// Strip any trailing dot
+	domain = strings.TrimSuffix(domain, ".")
+
+	parts := strings.Split(domain, ".")
+	if len(parts) <= 2 {
+		return domain // Already a root domain or simple TLD
+	}
+
+	// For most domains, return the last two parts (example.com)
+	return strings.Join(parts[len(parts)-2:], ".")
+}
+
 // certstreamClient connects to the certstream server and publishes domains to NATS message broker
 func certstreamClient(ctx context.Context, js nats.JetStreamContext) error {
 	log.Println("Connecting to certstream server at", certstreamURL)
@@ -262,10 +276,14 @@ func dnsResolver(ctx context.Context, workerID int, js nats.JetStreamContext, re
 					info.SOA = soaRecord
 				}
 
-				// Perform domain WHOIS lookup
-				domainWhois, err := whois.Whois(domain)
+				// Perform domain WHOIS lookup on the root domain, not the subdomain
+				rootDomain := extractRootDomain(domain)
+				domainWhois, err := whois.Whois(rootDomain)
 				if err == nil {
 					info.DomainWhois = domainWhois
+					log.Printf("Worker %d performed WHOIS for root domain %s from %s", workerID, rootDomain, domain)
+				} else {
+					log.Printf("Worker %d error performing WHOIS for domain %s: %v", workerID, rootDomain, err)
 				}
 
 				// Perform IP WHOIS lookups for each A record
@@ -273,6 +291,18 @@ func dnsResolver(ctx context.Context, workerID int, js nats.JetStreamContext, re
 					ipWhois, err := whois.Whois(ip)
 					if err == nil {
 						info.IPWhois[ip] = ipWhois
+					} else {
+						log.Printf("Worker %d error performing WHOIS for IP %s: %v", workerID, ip, err)
+					}
+				}
+
+				// Also perform IP WHOIS lookups for each AAAA record (IPv6)
+				for _, ip := range info.AAAA {
+					ipWhois, err := whois.Whois(ip)
+					if err == nil {
+						info.IPWhois[ip] = ipWhois
+					} else {
+						log.Printf("Worker %d error performing WHOIS for IP %s: %v", workerID, ip, err)
 					}
 				}
 
