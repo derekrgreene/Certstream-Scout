@@ -16,7 +16,7 @@ This tool opens a websocket connection to [Certstream Server Go](https://github.
 
 ## 🔧 Requirements
 
-- Go
+- Go ≥ v1.21
 - NATS server
 - Certstream server
 
