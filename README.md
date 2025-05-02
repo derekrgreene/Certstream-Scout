@@ -68,7 +68,7 @@ go run certstream-scout -certstream ws://your-certstream-server:8080/domains-onl
 - `-dns`: DNS server to use for lookups (default: `8.8.8.8:53`)
 - `-nats`: NATS server URL (default: `nats://localhost:4222`)
 - `-workers`: Number of worker goroutines (default: `500`)
-- `cache-ttl`: Time to keep domains in cache to avoid duplicates (default: `24`)
+- `cache-ttl`: Time to keep domains in cache to avoid duplicates (default: `24` hours)
 
 ## 📂 Output Format
 
