@@ -25,7 +25,7 @@ This tool opens a websocket connection to [Certstream Server Go](https://github.
 ```bash
 # Clone the repository
 git clone https://github.com/derekrgreene/certstream-scout.git
-cd certstream-scout
+cd Certstream-Scout
 
 # Install dependencies
 go mod tidy
@@ -46,7 +46,7 @@ git clone https://github.com/d-Rickyy-b/certstream-server-go.git
 
 Pull and run NATS (pre-built docker image)
 ```bash
-docker run -p 4222:4222 -p 8222:8222 nats -js
+docker run -d -p 4222:4222 -p 8222:8222 nats -js
 
 # Or to build from source 
 git clone https://github.com/nats-io/nats-server.git
@@ -60,6 +60,9 @@ go run certstream-scout
 
 # Run with custom settings
 go run certstream-scout -certstream ws://your-certstream-server:8080/domains-only/ -dns 1.1.1.1:53 -nats nats://your-nats-server:4222 -workers 50
+
+# Run with nohup for application persistence
+nohup go run certstream-scout > output.log 2>&1 &
 ```
 
 ### Available flags:
