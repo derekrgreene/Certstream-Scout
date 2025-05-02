@@ -25,7 +25,7 @@ This tool opens a websocket connection to [Certstream Server Go](https://github.
 ```bash
 # Clone the repository
 git clone https://github.com/derekrgreene/certstream-scout.git
-cd Certstream-Scout
+cd certstream-scout
 
 # Install dependencies
 go mod tidy
