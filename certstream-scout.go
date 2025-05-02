@@ -17,6 +17,7 @@ import (
 	"github.com/miekg/dns"
 	"github.com/nats-io/nats.go"
 	"github.com/patrickmn/go-cache"
+	"golang.org/x/net/publicsuffix" // Public suffix list for proper domain extraction
 )
 
 const (
@@ -50,6 +51,7 @@ type DomainEntry struct {
 // DomainInfo represents processed domain information
 type DomainInfo struct {
 	Domain      string            `json:"domain"`
+	RootDomain  string            `json:"root_domain"` // Added root domain field
 	A           []string          `json:"a_records"`
 	AAAA        []string          `json:"aaaa_records"`
 	MX          []string          `json:"mx_records"`
@@ -61,25 +63,28 @@ type DomainInfo struct {
 	Timestamp   time.Time         `json:"timestamp"`
 }
 
+// extractRootDomain gets the root domain from a subdomain using the public suffix list
+func extractRootDomain(domain string) string {
+	// Get the effective TLD plus one (eTLD+1)
+	etldPlusOne, err := publicsuffix.EffectiveTLDPlusOne(domain)
+	if err != nil {
+		log.Printf("Error extracting root domain for %s: %v, falling back to simple method", domain, err)
+		// Fall back to simple extraction on error
+		parts := strings.Split(domain, ".")
+		if len(parts) <= 2 {
+			return domain
+		}
+		return strings.Join(parts[len(parts)-2:], ".")
+	}
+
+	return etldPlusOne
+}
+
 // normalizeDomain removes "www." prefix and "*." prefix from domain names
 func normalizeDomain(domain string) string {
 	domain = strings.TrimPrefix(domain, "www.")
 	domain = strings.TrimPrefix(domain, "*.")
 	return domain
-}
-
-// extractRootDomain extracts the registrable domain for WHOIS queries
-func extractRootDomain(domain string) string {
-	// Strip any trailing dot
-	domain = strings.TrimSuffix(domain, ".")
-
-	parts := strings.Split(domain, ".")
-	if len(parts) <= 2 {
-		return domain // Already a root domain or simple TLD
-	}
-
-	// For most domains, return the last two parts (example.com)
-	return strings.Join(parts[len(parts)-2:], ".")
 }
 
 // certstreamClient connects to the certstream server and publishes domains to NATS message broker
@@ -228,16 +233,21 @@ func dnsResolver(ctx context.Context, workerID int, js nats.JetStreamContext, re
 
 				log.Printf("Worker %d processing domain: %s", workerID, domain)
 
+				// Extract the root domain for WHOIS queries
+				rootDomain := extractRootDomain(domain)
+				log.Printf("Worker %d extracted root domain: %s from: %s", workerID, rootDomain, domain)
+
 				info := DomainInfo{
-					Domain:    domain,
-					Timestamp: time.Now(),
-					A:         []string{},
-					AAAA:      []string{},
-					MX:        []string{},
-					TXT:       []string{},
-					CAA:       []string{},
-					SOA:       "",
-					IPWhois:   make(map[string]string),
+					Domain:     domain,
+					RootDomain: rootDomain,
+					Timestamp:  time.Now(),
+					A:          []string{},
+					AAAA:       []string{},
+					MX:         []string{},
+					TXT:        []string{},
+					CAA:        []string{},
+					SOA:        "",
+					IPWhois:    make(map[string]string),
 				}
 
 				// Perform A record lookup
@@ -276,28 +286,19 @@ func dnsResolver(ctx context.Context, workerID int, js nats.JetStreamContext, re
 					info.SOA = soaRecord
 				}
 
-				// Perform domain WHOIS lookup on the root domain, not the subdomain
-				rootDomain := extractRootDomain(domain)
+				// Perform domain WHOIS lookup on the root domain instead of the subdomain
+				log.Printf("Worker %d performing WHOIS lookup on root domain %s instead of full domain %s",
+					workerID, rootDomain, domain)
 				domainWhois, err := whois.Whois(rootDomain)
 				if err == nil {
 					info.DomainWhois = domainWhois
-					log.Printf("Worker %d performed WHOIS for root domain %s from %s", workerID, rootDomain, domain)
+					log.Printf("Worker %d successfully retrieved WHOIS data for root domain %s", workerID, rootDomain)
 				} else {
-					log.Printf("Worker %d error performing WHOIS for domain %s: %v", workerID, rootDomain, err)
+					log.Printf("Worker %d error performing WHOIS for root domain %s: %v", workerID, rootDomain, err)
 				}
 
 				// Perform IP WHOIS lookups for each A record
 				for _, ip := range info.A {
-					ipWhois, err := whois.Whois(ip)
-					if err == nil {
-						info.IPWhois[ip] = ipWhois
-					} else {
-						log.Printf("Worker %d error performing WHOIS for IP %s: %v", workerID, ip, err)
-					}
-				}
-
-				// Also perform IP WHOIS lookups for each AAAA record (IPv6)
-				for _, ip := range info.AAAA {
 					ipWhois, err := whois.Whois(ip)
 					if err == nil {
 						info.IPWhois[ip] = ipWhois
