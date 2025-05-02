@@ -1,0 +1,42 @@
+webserver:
+  listen_addr: "0.0.0.0"
+  listen_port: 8080
+  full_url: "/full-stream"
+  lite_url: "/"
+  domains_only_url: "/domains-only"
+  cert_path: ""
+  cert_key_path: ""
+  compression_enabled: false
+
+prometheus:
+  enabled: true
+  listen_addr: "0.0.0.0"
+  listen_port: 8080
+  metrics_url: "/metrics"
+  expose_system_metrics: false
+  real_ip: false
+  whitelist:
+    - "127.0.0.1/8"
+
+general:
+  # When you want to add logs that are not contained in the log list provided by
+  # Google (https://www.gstatic.com/ct/log_list/v3/log_list.json), you can add them here.
+  additional_logs:
+    - url: https://ct.googleapis.com/logs/us1/mirrors/digicert_nessie2022/
+      operator: "DigiCert"
+      description: "DigiCert Nessie2022 log"
+    - url: https://dodo.ct.comodo.com/
+      operator: "Comodo"
+      description: "Comodo Dodo"
+  # To optimize the performance of the server, you can overwrite the size of different buffers
+  # For low CPU, low memory machines, you should reduce the buffer sizes to save memory in case the CPU is maxed.
+  buffer_sizes:
+    # Buffer for each websocket connection
+    websocket: 300
+    # Buffer for each CT log connection
+    ctlog: 1000
+    # Combined buffer for the broadcast manager
+    broadcastmanager: 10000
+  # Google regularly updates the log list. If this option is set to true, the server will remove all old logs.
+  # This option defaults to true. See https://github.com/d-Rickyy-b/certstream-server-go/issues/51
+  drop_old_logs: false
