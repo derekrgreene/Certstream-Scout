@@ -16,6 +16,7 @@ import (
 	"github.com/likexian/whois"
 	"github.com/miekg/dns"
 	"github.com/nats-io/nats.go"
+	"github.com/patrickmn/go-cache"
 )
 
 const (
@@ -23,7 +24,8 @@ const (
 	numWorkers        = 500 // Number of worker goroutines for DNS/WHOIS resolution
 	dnsTimeout        = 5 * time.Second
 	outputDir         = "ctlog_data"
-	channelBufferSize = 10000 // Buffer for high throughput
+	channelBufferSize = 10000          // Buffer for high throughput
+	cacheTTL          = 24 * time.Hour // Time to keep domains in cache (avoid duplicates)
 )
 
 // Default values, can be overridden by cli flags
@@ -34,6 +36,8 @@ var (
 	streamName    = "CERTSTREAM"
 	subjectName   = "certstream.domains"
 	consumerGroup = "domain-processors"
+	// Domain cache with default expiration of 24 hours, cleanup every hour
+	domainCache = cache.New(cacheTTL, 1*time.Hour)
 )
 
 // DomainEntry represents the domain information from certstreams /domain-only endpoint
@@ -108,7 +112,7 @@ func certstreamClient(ctx context.Context, js nats.JetStreamContext) error {
 			// Track normalized domains to avoid duplicates within the same certificate
 			processedDomains := make(map[string]struct{})
 
-			// Send each domain to NATS
+			// Send each domain to NATS (if not already processed recently)
 			for _, domain := range entry.Data {
 				normalizedDomain := normalizeDomain(domain)
 				// Skip if empty after normalization
@@ -121,8 +125,18 @@ func certstreamClient(ctx context.Context, js nats.JetStreamContext) error {
 					continue
 				}
 
-				// Mark domain as processed
+				// Mark domain as processed in this certificate
 				processedDomains[normalizedDomain] = struct{}{}
+
+				// Check if domain is already in cache (processed within cacheTTL)
+				_, found := domainCache.Get(normalizedDomain)
+				if found {
+					log.Printf("Skipping recently seen domain: %s", normalizedDomain)
+					continue
+				}
+
+				// Add domain to cache to prevent reprocessing
+				domainCache.Set(normalizedDomain, true, cache.DefaultExpiration)
 
 				// Publish to NATS
 				_, err := js.Publish(subjectName, []byte(normalizedDomain))
@@ -175,6 +189,17 @@ func dnsResolver(ctx context.Context, workerID int, js nats.JetStreamContext, re
 			// Process messages
 			for _, msg := range msgs {
 				domain := string(msg.Data)
+
+				// Double-check that domain is still not in cache
+				// This is a safeguard in case of race conditions between workers
+				_, found := domainCache.Get(domain)
+				if found {
+					log.Printf("Worker %d skipping already processed domain: %s", workerID, domain)
+					if err := msg.Ack(); err != nil {
+						log.Printf("Worker %d error acknowledging skipped message: %v", workerID, err)
+					}
+					continue
+				}
 
 				log.Printf("Worker %d processing domain: %s", workerID, domain)
 
@@ -418,6 +443,7 @@ func main() {
 	dnsServerFlag := flag.String("dns", dnsServer, "DNS server to use for lookups")
 	workersFlag := flag.Int("workers", numWorkers, "Number of worker goroutines")
 	natsURLFlag := flag.String("nats", natsURL, "NATS server URL")
+	cacheTTLFlag := flag.Duration("cache-ttl", cacheTTL, "Time to keep domains in cache (to avoid duplicates)")
 	flag.Parse()
 
 	// Update vars based on flags
@@ -432,9 +458,17 @@ func main() {
 	}
 	numWorkers := *workersFlag
 
+	// Update cache TTL if specified
+	if *cacheTTLFlag != cacheTTL {
+		cacheTTL = *cacheTTLFlag
+		// Recreate cache with new TTL
+		domainCache = cache.New(cacheTTL, 1*time.Hour)
+	}
+
 	log.Printf("Starting real-time domain analyzer with certstream at %s", certstreamURL)
 	log.Printf("Using NATS server at %s", natsURL)
 	log.Printf("Using %d worker goroutines", numWorkers)
+	log.Printf("Domain cache TTL set to %s", cacheTTL)
 
 	// Connect to NATS
 	nc, err := nats.Connect(natsURL)
@@ -483,7 +517,7 @@ func main() {
 		cancel()
 	}()
 
-	// Channel for result communication (still needed for the result saver)
+	// Channel for result communication
 	resultChan := make(chan DomainInfo, channelBufferSize)
 
 	// Wait group for all workers
