@@ -16,14 +16,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
-	"github.com/likexian/whois"
-	"github.com/miekg/dns"
-	"github.com/nats-io/nats.go"
-	"github.com/patrickmn/go-cache"
+	"github.com/gorilla/websocket"  // For websocket connection
+	"github.com/likexian/whois"     // For WHOIS resolution
+	"github.com/miekg/dns"          // For DNS resolution
+	"github.com/nats-io/nats.go"    // For NATS message broker/server
+	"github.com/patrickmn/go-cache" // For caching
 	"golang.org/x/net/publicsuffix" // Public suffix list for proper domain extraction
 	"golang.org/x/sys/unix"         // For non-blocking IO on Unix
-	"golang.org/x/time/rate"        // Import the rate package for rate limiting
+	"golang.org/x/time/rate"        // For rate limiting
 )
 
 const (
@@ -264,8 +264,6 @@ func certstreamClient(ctx context.Context, js nats.JetStreamContext) error {
 					cacheMutex.Unlock()
 					continue
 				}
-				// IMPORTANT FIX: We now DON'T add the domain to cache here
-				// We'll let the worker add it to cache after successful processing
 				cacheMutex.Unlock()
 
 				// Publish to NATS
@@ -361,7 +359,6 @@ func dnsResolver(ctx context.Context, workerID int, js nats.JetStreamContext, re
 				}
 
 				// Mark the domain as being processed to prevent other workers from processing it
-				// This is a critical fix - we add to cache BEFORE processing, not after
 				domainCache.Set(domain, true, cache.DefaultExpiration)
 				cacheMutex.Unlock()
 
@@ -715,8 +712,8 @@ func makeStdinBlocking() {
 // hasKeyboardInput checks if there's input waiting on stdin
 func hasKeyboardInput() bool {
 	if runtime.GOOS == "windows" {
-		// Windows doesn't support non-blocking stdin checks easily
-		// So we'll use a timeout approach
+		// Windows doesn't support non-blocking stdin easily
+		// Timeout approach
 		c := make(chan struct{})
 		go func() {
 			var b [1]byte
@@ -1005,11 +1002,9 @@ func main() {
 	stateMutex.Lock()
 	isRunning = false
 	stateMutex.Unlock()
-
-	// Simply clear screen after initialization is complete and go straight to menu
 	clearScreen()
 
-	// Run interactive user interface
+	// Run user interface
 	runUserInterface(ctx, cancel)
 
 	// Wait for all workers to finish after context is cancelled
