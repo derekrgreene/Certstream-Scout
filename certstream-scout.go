@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"flag"
@@ -24,9 +25,8 @@ import (
 
 const (
 	pingInterval      = 30 * time.Second
-	numWorkers        = 500 // Number of worker goroutines for DNS/WHOIS resolution
+	numWorkers        = 50 // Number of worker goroutines for DNS/WHOIS resolution
 	dnsTimeout        = 5 * time.Second
-	outputDir         = "ctlog_data"
 	channelBufferSize = 10000 // Buffer for high throughput
 )
 
@@ -38,6 +38,7 @@ var (
 	streamName    = "CERTSTREAM"
 	subjectName   = "certstream.domains"
 	consumerGroup = "domain-processors"
+	outputDir     = "ctlog_data"
 	cacheTTL      = 24 * time.Hour // Time to keep domains in cache (avoid duplicates)
 	// Domain cache with default expiration of 24 hours, cleanup every hour
 	domainCache = cache.New(cacheTTL, 1*time.Hour)
@@ -50,6 +51,13 @@ var (
 	// WHOIS cache with longer expiration (1 week)
 	whoisCache      = cache.New(7*24*time.Hour, 1*time.Hour) // WHOIS results cache
 	whoisCacheMutex = &sync.Mutex{}                          // Mutex for WHOIS cache
+
+	// Application state
+	isRunning   bool
+	stateMutex  = &sync.Mutex{}
+	totalQueued int64
+	processing  int64
+	statsChan   = make(chan struct{}, 1) // Signal channel for stats updates
 )
 
 // DomainEntry represents the domain information from certstreams /domain-only endpoint
@@ -197,6 +205,17 @@ func certstreamClient(ctx context.Context, js nats.JetStreamContext) error {
 				return fmt.Errorf("ping error: %w", err)
 			}
 		default:
+			// Check if processing is paused
+			stateMutex.Lock()
+			currentlyRunning := isRunning
+			stateMutex.Unlock()
+
+			if !currentlyRunning {
+				// If paused, just wait a bit and check again
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
+
 			// Read message from WebSocket
 			_, message, err := c.ReadMessage()
 			if err != nil {
@@ -242,8 +261,6 @@ func certstreamClient(ctx context.Context, js nats.JetStreamContext) error {
 					cacheMutex.Unlock()
 					continue
 				}
-				// IMPORTANT FIX: We now DON'T add the domain to cache here
-				// We'll let the worker add it to cache after successful processing
 				cacheMutex.Unlock()
 
 				// Publish to NATS
@@ -252,6 +269,20 @@ func certstreamClient(ctx context.Context, js nats.JetStreamContext) error {
 					log.Printf("Error publishing to NATS: %v", err)
 					continue
 				}
+
+				// Update statistics
+				stateMutex.Lock()
+				totalQueued++
+				processing++
+				stateMutex.Unlock()
+
+				// Signal stats update
+				select {
+				case statsChan <- struct{}{}:
+				default:
+					// Channel already has an update pending
+				}
+
 				log.Printf("Published domain to NATS: %s", normalizedDomain)
 			}
 		}
@@ -308,11 +339,22 @@ func dnsResolver(ctx context.Context, workerID int, js nats.JetStreamContext, re
 					if err := msg.Ack(); err != nil {
 						log.Printf("Worker %d error acknowledging skipped message: %v", workerID, err)
 					}
+
+					stateMutex.Lock()
+					processing--
+					stateMutex.Unlock()
+
+					// Signal stats update
+					select {
+					case statsChan <- struct{}{}:
+					default:
+						// Channel already has an update pending
+					}
+
 					continue
 				}
 
-				// Mark the domain as being processed to prevent other workers from processing it
-				// This is a critical fix - we add to cache BEFORE processing, not after
+				// Mark the domain as being processed to prevent other workers processing it
 				domainCache.Set(domain, true, cache.DefaultExpiration)
 				cacheMutex.Unlock()
 
@@ -402,6 +444,19 @@ func dnsResolver(ctx context.Context, workerID int, js nats.JetStreamContext, re
 						log.Printf("Worker %d error acknowledging message: %v", workerID, err)
 					}
 					log.Printf("Worker %d successfully processed domain: %s", workerID, domain)
+
+					// Update statistics
+					stateMutex.Lock()
+					processing--
+					stateMutex.Unlock()
+
+					// Signal stats update
+					select {
+					case statsChan <- struct{}{}:
+					default:
+						// Channel already has an update pending
+					}
+
 				case <-ctx.Done():
 					return nil
 				default:
@@ -568,6 +623,92 @@ func resultSaver(ctx context.Context, resultChan <-chan DomainInfo) error {
 	}
 }
 
+// displayStats displays domain processing statistics
+func displayStats() {
+	stateMutex.Lock()
+	defer stateMutex.Unlock()
+
+	status := "STOPPED"
+	if isRunning {
+		status = "RUNNING"
+	}
+
+	fmt.Printf("\n========= Domain Processing Status [%s] =========\n", status)
+	fmt.Printf("Total domains queued: %d\n", totalQueued)
+	fmt.Printf("Currently processing: %d\n", processing)
+	fmt.Printf("Completed: %d\n", totalQueued-processing)
+	fmt.Printf("Output directory: %s\n", outputDir)
+	fmt.Println("=============================================")
+}
+
+// runUserInterface handles user input for controlling the application
+func runUserInterface(ctx context.Context, cancel context.CancelFunc) {
+	reader := bufio.NewReader(os.Stdin)
+
+	// Starting stats display goroutine
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-statsChan:
+				displayStats()
+			case <-time.After(5 * time.Second):
+				// Also update stats regularly
+				displayStats()
+			}
+		}
+	}()
+
+	for {
+		displayMenu()
+
+		input, err := reader.ReadString('\n')
+		if err != nil {
+			log.Printf("Error reading input: %v", err)
+			continue
+		}
+
+		input = strings.TrimSpace(input)
+
+		switch input {
+		case "1":
+			// Start domain aggregation
+			stateMutex.Lock()
+			isRunning = true
+			stateMutex.Unlock()
+			fmt.Println("Domain aggregation STARTED")
+			displayStats()
+
+		case "2":
+			// Stop domain aggregation
+			stateMutex.Lock()
+			isRunning = false
+			stateMutex.Unlock()
+			fmt.Println("Domain aggregation STOPPED")
+			displayStats()
+
+		case "3":
+			// Quit application
+			fmt.Println("Shutting down...")
+			cancel()
+			return
+
+		default:
+			fmt.Println("Invalid option, please try again")
+		}
+	}
+}
+
+// displayMenu shows the user interface menu
+func displayMenu() {
+	fmt.Println("\n========= Domain Analyzer Menu =========")
+	fmt.Println("1. Start domain aggregation")
+	fmt.Println("2. Stop domain aggregation")
+	fmt.Println("3. Quit")
+	fmt.Print("Enter your choice (1-3): ")
+}
+
 func main() {
 	// Parse cli flags
 	certstreamURLFlag := flag.String("certstream", certstreamURL, "Certstream WebSocket URL")
@@ -575,6 +716,7 @@ func main() {
 	workersFlag := flag.Int("workers", numWorkers, "Number of worker goroutines")
 	natsURLFlag := flag.String("nats", natsURL, "NATS server URL")
 	cacheTTLFlag := flag.Duration("cache-ttl", cacheTTL, "Time to keep domains in cache (to avoid duplicates)")
+	outputDirFlag := flag.String("output-dir", outputDir, "Directory to store output files")
 
 	// WHOIS rate limiting flags
 	domainWhoisRateFlag := flag.Duration("domain-whois-rate", 500*time.Millisecond, "Time between domain WHOIS queries")
@@ -593,6 +735,9 @@ func main() {
 	if *natsURLFlag != "" {
 		natsURL = *natsURLFlag
 	}
+	if *outputDirFlag != "" {
+		outputDir = *outputDirFlag
+	}
 	numWorkers := *workersFlag
 
 	// Update cache TTL if specified
@@ -605,26 +750,15 @@ func main() {
 	// Update WHOIS rate limiters if specified
 	if *domainWhoisRateFlag != 5*time.Second {
 		domainWhoisLimiter = rate.NewLimiter(rate.Every(*domainWhoisRateFlag), 1)
-		log.Printf("Domain WHOIS rate set to one query per %s", *domainWhoisRateFlag)
 	}
 	if *ipWhoisRateFlag != 10*time.Second {
 		ipWhoisLimiter = rate.NewLimiter(rate.Every(*ipWhoisRateFlag), 1)
-		log.Printf("IP WHOIS rate set to one query per %s", *ipWhoisRateFlag)
 	}
 
 	// Update WHOIS cache TTL if specified
 	if *whoisCacheTTLFlag != 7*24*time.Hour {
 		whoisCache = cache.New(*whoisCacheTTLFlag, 1*time.Hour)
-		log.Printf("WHOIS cache TTL set to %s", *whoisCacheTTLFlag)
 	}
-
-	log.Printf("Starting real-time domain analyzer with certstream at %s", certstreamURL)
-	log.Printf("Using NATS server at %s", natsURL)
-	log.Printf("Using %d worker goroutines", numWorkers)
-	log.Printf("Domain cache TTL set to %s", cacheTTL)
-	log.Printf("Domain WHOIS rate limit: 1 query per %s", domainWhoisLimiter.Limit())
-	log.Printf("IP WHOIS rate limit: 1 query per %s", ipWhoisLimiter.Limit())
-	log.Printf("WHOIS cache TTL set to %s", *whoisCacheTTLFlag)
 
 	// Initialize random seed for jitter
 	rand.Seed(time.Now().UnixNano())
@@ -647,7 +781,6 @@ func main() {
 	if err != nil && err != nats.ErrStreamNotFound {
 		log.Fatalf("Failed to delete existing stream: %v", err)
 	}
-	log.Printf("Deleted existing stream (if any)")
 
 	// Create new stream with WorkQueuePolicy
 	_, err = js.AddStream(&nats.StreamConfig{
@@ -661,7 +794,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to create stream: %v", err)
 	}
-	log.Printf("Created new stream with WorkQueuePolicy")
 
 	// Create a cancellable context
 	ctx, cancel := context.WithCancel(context.Background())
@@ -713,7 +845,29 @@ func main() {
 		}
 	}()
 
-	// Wait for all workers to finish
+	// Set initial state to stopped
+	stateMutex.Lock()
+	isRunning = false
+	stateMutex.Unlock()
+
+	fmt.Println("======================================================")
+	fmt.Println("Domain Analyzer initialized with the following settings:")
+	fmt.Println("------------------------------------------------------")
+	fmt.Printf("Certstream URL: %s\n", certstreamURL)
+	fmt.Printf("DNS Server: %s\n", dnsServer)
+	fmt.Printf("NATS Server: %s\n", natsURL)
+	fmt.Printf("Number of Workers: %d\n", numWorkers)
+	fmt.Printf("Output Directory: %s\n", outputDir)
+	fmt.Printf("Domain Cache TTL: %s\n", cacheTTL)
+	fmt.Printf("Domain WHOIS Rate: 1 query per %v\n", domainWhoisLimiter.Limit())
+	fmt.Printf("IP WHOIS Rate: 1 query per %v\n", ipWhoisLimiter.Limit())
+	fmt.Printf("WHOIS Cache TTL: %s\n", *whoisCacheTTLFlag)
+	fmt.Println("======================================================")
+	fmt.Println("Starting user interface...")
+
+	runUserInterface(ctx, cancel)
+
+	// Wait for all workers to finish after context is cancelled
 	wg.Wait()
-	log.Println("All workers finished, exiting")
+	fmt.Println("All workers have shut down. Application exiting.")
 }
