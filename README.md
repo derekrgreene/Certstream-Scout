@@ -16,10 +16,7 @@ This tool opens a websocket connection to [Certstream Server Go](https://github.
 
 ## 🔧 Requirements
 
-- Go ≥ v1.21
-- Docker
-- NATS server
-- Certstream server
+- Docker - That's it! All other dependencies are containerized
 
 ## 🐳 Installation
 
