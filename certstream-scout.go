@@ -630,6 +630,19 @@ func resultSaver(ctx context.Context, resultChan <-chan DomainInfo) error {
 	}
 }
 
+// countFilesInDirectory counts files in a directory for total files completed stat
+func countFilesInDirectory(dir string) (int, error) {
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		// If directory doesn't exist yet, return 0
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	return len(files), nil
+}
+
 // displayLiveStats shows statistics with live updates until user presses a key
 func displayLiveStats(ctx context.Context) {
 	reader := bufio.NewReader(os.Stdin)
@@ -639,9 +652,6 @@ func displayLiveStats(ctx context.Context) {
 	defer makeStdinBlocking()
 
 	clearScreen()
-	fmt.Println("===== LIVE STATISTICS VIEW =====")
-	fmt.Println("Press any key to return to menu...")
-
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -653,6 +663,13 @@ func displayLiveStats(ctx context.Context) {
 			// Clear only the stats portion, not the header
 			moveCursorUp(6) // Move up to clear previous stats
 
+			// Get the actual count of completed domains by counting files
+			completedCount, err := countFilesInDirectory(outputDir)
+			if err != nil {
+				completedCount = 0
+				log.Printf("Error counting completed files: %v", err)
+			}
+
 			stateMutex.Lock()
 			status := "STOPPED"
 			if isRunning {
@@ -662,9 +679,10 @@ func displayLiveStats(ctx context.Context) {
 			fmt.Printf("\r\033[K========= Domain Processing Status [%s] =========\n", status)
 			fmt.Printf("\r\033[KTotal domains queued: %d\n", totalQueued)
 			fmt.Printf("\r\033[KCurrently processing: %d\n", processing)
-			fmt.Printf("\r\033[KCompleted: %d\n", totalQueued-processing)
+			fmt.Printf("\r\033[KCompleted: %d\n", completedCount)
 			fmt.Printf("\r\033[KOutput directory: %s\n", outputDir)
 			fmt.Printf("\r\033[K=============================================\n")
+			fmt.Printf("Press any key to return to menu...")
 			stateMutex.Unlock()
 		default:
 			// Check if key was pressed
