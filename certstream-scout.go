@@ -867,9 +867,9 @@ func main() {
 	}
 
 	// Display initialization settings
-	fmt.Println("=========================================================")
-	fmt.Println("Certstream-Scout initialized with the following settings:")
-	fmt.Println("---------------------------------------------------------")
+	fmt.Println("======================================================")
+	fmt.Println("Domain Analyzer initialized with the following settings:")
+	fmt.Println("------------------------------------------------------")
 	fmt.Printf("Certstream URL: %s\n", certstreamURL)
 	fmt.Printf("DNS Server: %s\n", dnsServer)
 	fmt.Printf("NATS Server: %s\n", natsURL)
@@ -882,7 +882,7 @@ func main() {
 	fmt.Println("======================================================")
 	fmt.Println("Press any key to continue...")
 
-	// Wait for any key
+	// Wait for any key press before proceeding
 	makeStdinNonBlocking()
 	bufio.NewReader(os.Stdin).ReadByte()
 	makeStdinBlocking()
@@ -988,12 +988,7 @@ func main() {
 	isRunning = false
 	stateMutex.Unlock()
 
-	clearScreen()
-	fmt.Println("System initialized and ready!")
-	fmt.Println("Press any key to continue to menu...")
-	makeStdinNonBlocking()
-	bufio.NewReader(os.Stdin).ReadByte()
-	makeStdinBlocking()
+	// Simply clear screen after initialization is complete and go straight to menu
 	clearScreen()
 
 	// Run interactive user interface
