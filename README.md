@@ -17,49 +17,42 @@ This tool opens a websocket connection to [Certstream Server Go](https://github.
 ## 🔧 Requirements
 
 - Go ≥ v1.21
+- Docker
 - NATS server
 - Certstream server
 
-## 🚀 Installation
+## 🐳 Installation
 
 ```bash
 # Clone the repository
 git clone https://github.com/derekrgreene/certstream-scout.git
 cd certstream-scout
 
-# Install dependencies
-go mod tidy
+# Build container images
+docker-compose build
 
-# Build the application
-go build
+# Start all services
+docker-compose up -d
 ```
 
 ## ⚙️ Configuration
 
-Pull and run certstream-server-go (pre-built docker image)
+Connect to Certstream-Scout container and start app
 ```bash
-docker run -d -v ./config.yaml:/app/config.yaml -p 8080:8080 0rickyy0/certstream-server-go
+docker exec -it certstream-scout_certstream-scout_1 /bin/sh
 
-# Or to build from source 
-git clone https://github.com/d-Rickyy-b/certstream-server-go.git
-```
-
-Pull and run NATS (pre-built docker image)
-```bash
-docker run -d -p 4222:4222 -p 8222:8222 nats -js
-
-# Or to build from source 
-git clone https://github.com/nats-io/nats-server.git
+# Once connected run 
+./entrypoint.sh
 ```
 
 The application can be configured using command-line flags:
 
 ```bash
 # Run with default settings
-go run certstream-scout
+./certstream-scout
 
 # Run with custom settings
-go run certstream-scout -certstream ws://your-certstream-server:8080/domains-only/ -dns 1.1.1.1:53 -nats nats://your-nats-server:4222 -workers 50
+./certstream-scout -certstream ws://your-certstream-server:8080/domains-only/ -dns 1.1.1.1:53 -nats nats://your-nats-server:4222 -workers 50
 ```
 
 ### Available flags:

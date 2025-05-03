@@ -1,0 +1,52 @@
+version: '3.8'
+
+services:
+  nats:
+    image: nats
+    command: -js
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "4222"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - certstream-network
+    restart: unless-stopped
+
+  certstream:
+    image: 0rickyy0/certstream-server-go
+    volumes:
+      - ./config.yaml:/app/config.yaml
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - certstream-network
+    restart: unless-stopped
+
+  certstream-scout:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      - nats
+      - certstream
+    volumes:
+      - ./ctlog_data:/app/ctlog_data
+    entrypoint: ["/bin/sh", "-c", "sleep infinity"]
+    tty: true
+    stdin_open: true
+    networks:
+      - certstream-network
+    restart: unless-stopped
+
+networks:
+  certstream-network:
+    driver: bridge
