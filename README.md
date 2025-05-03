@@ -69,6 +69,9 @@ go run certstream-scout -certstream ws://your-certstream-server:8080/domains-onl
 - `-nats`: NATS server URL (default: `nats://localhost:4222`)
 - `-workers`: Number of worker goroutines (default: `500`)
 - `cache-ttl`: Time to keep domains in cache to avoid duplicates (default: `24` hours)
+- `domain-whois-rate`: Time between domain WHOIS queries (default: `500` ms)
+- `ip-whois-rate`: Time between IP WHOIS queries (default: 1ms)
+- `whois-cache-ttl`: Time to keep WHOIS results in cache (default: `168` hours / 7 days)
 
 ## 📂 Output Format
 
