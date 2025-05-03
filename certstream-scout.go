@@ -825,7 +825,7 @@ func clearScreen() {
 
 // displayMenu shows the user interface menu
 func displayMenu() {
-	fmt.Println("\n========= Domain Analyzer Menu =========")
+	fmt.Println("\n========= Certstream-Scout =========")
 	fmt.Println("1. Start domain aggregation")
 	fmt.Println("2. Stop domain aggregation")
 	fmt.Println("3. View statistics")
@@ -886,7 +886,7 @@ func main() {
 
 	// Display initialization settings
 	fmt.Println("======================================================")
-	fmt.Println("Domain Analyzer initialized with the following settings:")
+	fmt.Println("Certstream-Scout initialized with the following settings:")
 	fmt.Println("------------------------------------------------------")
 	fmt.Printf("Certstream URL: %s\n", certstreamURL)
 	fmt.Printf("DNS Server: %s\n", dnsServer)
