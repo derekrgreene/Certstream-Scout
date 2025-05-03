@@ -577,7 +577,7 @@ func main() {
 	cacheTTLFlag := flag.Duration("cache-ttl", cacheTTL, "Time to keep domains in cache (to avoid duplicates)")
 
 	// WHOIS rate limiting flags
-	domainWhoisRateFlag := flag.Duration("domain-whois-rate", 1*time.Millisecond, "Time between domain WHOIS queries")
+	domainWhoisRateFlag := flag.Duration("domain-whois-rate", 500*time.Millisecond, "Time between domain WHOIS queries")
 	ipWhoisRateFlag := flag.Duration("ip-whois-rate", 1*time.Millisecond, "Time between IP WHOIS queries")
 	whoisCacheTTLFlag := flag.Duration("whois-cache-ttl", 7*24*time.Hour, "Time to keep WHOIS results in cache")
 
