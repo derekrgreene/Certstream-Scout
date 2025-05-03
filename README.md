@@ -80,6 +80,7 @@ Results are saved as JSON files in the `ctlog_data` directory. Each file contain
 ```json
 {
   "domain": "example.com",
+  "root_domain": "example.com",
   "a_records": ["93.184.216.34"],
   "aaaa_records": ["2606:2800:220:1:248:1893:25c8:1946"],
   "mx_records": ["10 mx.example.com"],
