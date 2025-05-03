@@ -20,7 +20,7 @@ jobs:
       - name: Build
         run: |
           mkdir -p build
-          go build -o build/certstream-scout ./cmd/worker
+          go build -o build/certstream-scout .
 
       - name: Upload binary as artifact
         uses: actions/upload-artifact@v4
