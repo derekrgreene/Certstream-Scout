@@ -22,6 +22,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/patrickmn/go-cache"
 	"golang.org/x/net/publicsuffix" // Public suffix list for proper domain extraction
+	"golang.org/x/sys/unix"         // For non-blocking IO on Unix
 	"golang.org/x/time/rate"        // Import the rate package for rate limiting
 )
 
@@ -629,37 +630,112 @@ func resultSaver(ctx context.Context, resultChan <-chan DomainInfo) error {
 	}
 }
 
-// displayStats displays domain processing statistics
-func displayStats() {
-	stateMutex.Lock()
-	defer stateMutex.Unlock()
+// displayLiveStats shows statistics with live updates until user presses a key
+func displayLiveStats(ctx context.Context) {
+	reader := bufio.NewReader(os.Stdin)
 
-	status := "STOPPED"
-	if isRunning {
-		status = "RUNNING"
+	// Make stdin non-blocking
+	makeStdinNonBlocking()
+	defer makeStdinBlocking()
+
+	clearScreen()
+	fmt.Println("===== LIVE STATISTICS VIEW =====")
+	fmt.Println("Press any key to return to menu...")
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// Clear only the stats portion, not the header
+			moveCursorUp(6) // Move up to clear previous stats
+
+			stateMutex.Lock()
+			status := "STOPPED"
+			if isRunning {
+				status = "RUNNING"
+			}
+
+			fmt.Printf("\r\033[K========= Domain Processing Status [%s] =========\n", status)
+			fmt.Printf("\r\033[KTotal domains queued: %d\n", totalQueued)
+			fmt.Printf("\r\033[KCurrently processing: %d\n", processing)
+			fmt.Printf("\r\033[KCompleted: %d\n", totalQueued-processing)
+			fmt.Printf("\r\033[KOutput directory: %s\n", outputDir)
+			fmt.Printf("\r\033[K=============================================\n")
+			stateMutex.Unlock()
+		default:
+			// Check if key was pressed
+			if hasKeyboardInput() {
+				reader.ReadString('\n') // Clear the input
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
 	}
+}
 
-	fmt.Printf("\n========= Domain Processing Status [%s] =========\n", status)
-	fmt.Printf("Total domains queued: %d\n", totalQueued)
-	fmt.Printf("Currently processing: %d\n", processing)
-	fmt.Printf("Completed: %d\n", totalQueued-processing)
-	fmt.Printf("Output directory: %s\n", outputDir)
-	fmt.Println("=============================================")
-	fmt.Println("\nPress Enter to return to menu...")
+// makeStdinNonBlocking configures terminal for non-blocking input
+func makeStdinNonBlocking() {
+	// Only for Unix-like systems
+	if runtime.GOOS != "windows" {
+		exec.Command("stty", "-F", "/dev/tty", "cbreak", "min", "1").Run()
+		exec.Command("stty", "-F", "/dev/tty", "-echo").Run()
+	}
+}
+
+// makeStdinBlocking restores terminal settings
+func makeStdinBlocking() {
+	// Only for Unix-like systems
+	if runtime.GOOS != "windows" {
+		exec.Command("stty", "-F", "/dev/tty", "echo").Run()
+	}
+}
+
+// hasKeyboardInput checks if there's input waiting on stdin
+func hasKeyboardInput() bool {
+	if runtime.GOOS == "windows" {
+		// Windows doesn't support non-blocking stdin checks easily
+		// So we'll use a timeout approach
+		c := make(chan struct{})
+		go func() {
+			var b [1]byte
+			os.Stdin.Read(b[:])
+			close(c)
+		}()
+
+		select {
+		case <-c:
+			return true
+		case <-time.After(10 * time.Millisecond):
+			return false
+		}
+	} else {
+		var readfds unix.FdSet
+		fd := int(os.Stdin.Fd())
+		readfds.Set(fd)
+
+		// Zero timeout for non-blocking
+		timeout := &unix.Timeval{
+			Sec:  0,
+			Usec: 0,
+		}
+
+		n, err := unix.Select(fd+1, &readfds, nil, nil, timeout)
+		return err == nil && n > 0 && readfds.IsSet(fd)
+	}
+}
+
+// moveCursorUp moves cursor up n lines
+func moveCursorUp(n int) {
+	fmt.Printf("\033[%dA", n)
 }
 
 // runUserInterface handles user input for controlling the application
 func runUserInterface(ctx context.Context, cancel context.CancelFunc) {
 	reader := bufio.NewReader(os.Stdin)
-
-	// Redirect log output to file
-	logFile, err := os.OpenFile("certstream-scout.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-	if err == nil {
-		log.SetOutput(logFile)
-		defer logFile.Close()
-	} else {
-		fmt.Println("Warning: Could not create log file, logs will appear in console")
-	}
 
 	// Clear screen and show initial menu
 	clearScreen()
@@ -697,10 +773,8 @@ func runUserInterface(ctx context.Context, cancel context.CancelFunc) {
 			clearScreen()
 
 		case "3":
-			// Display statistics
-			clearScreen()
-			displayStats()
-			reader.ReadString('\n') // Wait for Enter key
+			// Display live statistics
+			displayLiveStats(ctx)
 			clearScreen()
 
 		case "4":
@@ -792,8 +866,40 @@ func main() {
 		whoisCache = cache.New(*whoisCacheTTLFlag, 1*time.Hour)
 	}
 
+	// Display initialization settings
+	fmt.Println("=========================================================")
+	fmt.Println("Certstream-Scout initialized with the following settings:")
+	fmt.Println("---------------------------------------------------------")
+	fmt.Printf("Certstream URL: %s\n", certstreamURL)
+	fmt.Printf("DNS Server: %s\n", dnsServer)
+	fmt.Printf("NATS Server: %s\n", natsURL)
+	fmt.Printf("Number of Workers: %d\n", numWorkers)
+	fmt.Printf("Output Directory: %s\n", outputDir)
+	fmt.Printf("Domain Cache TTL: %s\n", cacheTTL)
+	fmt.Printf("Domain WHOIS Rate: 1 query per %v\n", domainWhoisLimiter.Limit())
+	fmt.Printf("IP WHOIS Rate: 1 query per %v\n", ipWhoisLimiter.Limit())
+	fmt.Printf("WHOIS Cache TTL: %s\n", *whoisCacheTTLFlag)
+	fmt.Println("======================================================")
+	fmt.Println("Press any key to continue...")
+
+	// Wait for any key
+	makeStdinNonBlocking()
+	bufio.NewReader(os.Stdin).ReadByte()
+	makeStdinBlocking()
+
 	// Initialize random seed for jitter
 	rand.Seed(time.Now().UnixNano())
+
+	// Redirect logs to file at this point (before NATS connection)
+	logFile, err := os.OpenFile("certstream-scout.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err == nil {
+		log.SetOutput(logFile)
+		defer logFile.Close()
+	} else {
+		fmt.Println("Warning: Could not create log file, logs will appear in console")
+		fmt.Println("Press Enter to continue anyway...")
+		bufio.NewReader(os.Stdin).ReadString('\n')
+	}
 
 	// Connect to NATS
 	nc, err := nats.Connect(natsURL)
@@ -882,20 +988,13 @@ func main() {
 	isRunning = false
 	stateMutex.Unlock()
 
-	fmt.Println("======================================================")
-	fmt.Println("Domain Analyzer initialized with the following settings:")
-	fmt.Println("------------------------------------------------------")
-	fmt.Printf("Certstream URL: %s\n", certstreamURL)
-	fmt.Printf("DNS Server: %s\n", dnsServer)
-	fmt.Printf("NATS Server: %s\n", natsURL)
-	fmt.Printf("Number of Workers: %d\n", numWorkers)
-	fmt.Printf("Output Directory: %s\n", outputDir)
-	fmt.Printf("Domain Cache TTL: %s\n", cacheTTL)
-	fmt.Printf("Domain WHOIS Rate: 1 query per %v\n", domainWhoisLimiter.Limit())
-	fmt.Printf("IP WHOIS Rate: 1 query per %v\n", ipWhoisLimiter.Limit())
-	fmt.Printf("WHOIS Cache TTL: %s\n", *whoisCacheTTLFlag)
-	fmt.Println("======================================================")
-	fmt.Println("Starting user interface...")
+	clearScreen()
+	fmt.Println("System initialized and ready!")
+	fmt.Println("Press any key to continue to menu...")
+	makeStdinNonBlocking()
+	bufio.NewReader(os.Stdin).ReadByte()
+	makeStdinBlocking()
+	clearScreen()
 
 	// Run interactive user interface
 	runUserInterface(ctx, cancel)
