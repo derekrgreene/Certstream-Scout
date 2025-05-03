@@ -28,7 +28,7 @@ import (
 
 const (
 	pingInterval      = 30 * time.Second
-	numWorkers        = 50 // Number of worker goroutines for DNS/WHOIS resolution
+	numWorkers        = 500 // Number of worker goroutines for DNS/WHOIS resolution
 	dnsTimeout        = 5 * time.Second
 	channelBufferSize = 10000 // Buffer for high throughput
 )
