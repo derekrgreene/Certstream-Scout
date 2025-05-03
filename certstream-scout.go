@@ -9,7 +9,9 @@ import (
 	"log"
 	"math/rand"
 	"os"
+	"os/exec"
 	"os/signal"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -261,6 +263,8 @@ func certstreamClient(ctx context.Context, js nats.JetStreamContext) error {
 					cacheMutex.Unlock()
 					continue
 				}
+				// IMPORTANT FIX: We now DON'T add the domain to cache here
+				// We'll let the worker add it to cache after successful processing
 				cacheMutex.Unlock()
 
 				// Publish to NATS
@@ -340,6 +344,7 @@ func dnsResolver(ctx context.Context, workerID int, js nats.JetStreamContext, re
 						log.Printf("Worker %d error acknowledging skipped message: %v", workerID, err)
 					}
 
+					// Update statistics for skipped domain
 					stateMutex.Lock()
 					processing--
 					stateMutex.Unlock()
@@ -354,7 +359,8 @@ func dnsResolver(ctx context.Context, workerID int, js nats.JetStreamContext, re
 					continue
 				}
 
-				// Mark the domain as being processed to prevent other workers processing it
+				// Mark the domain as being processed to prevent other workers from processing it
+				// This is a critical fix - we add to cache BEFORE processing, not after
 				domainCache.Set(domain, true, cache.DefaultExpiration)
 				cacheMutex.Unlock()
 
@@ -639,33 +645,31 @@ func displayStats() {
 	fmt.Printf("Completed: %d\n", totalQueued-processing)
 	fmt.Printf("Output directory: %s\n", outputDir)
 	fmt.Println("=============================================")
+	fmt.Println("\nPress Enter to return to menu...")
 }
 
 // runUserInterface handles user input for controlling the application
 func runUserInterface(ctx context.Context, cancel context.CancelFunc) {
 	reader := bufio.NewReader(os.Stdin)
 
-	// Starting stats display goroutine
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-statsChan:
-				displayStats()
-			case <-time.After(5 * time.Second):
-				// Also update stats regularly
-				displayStats()
-			}
-		}
-	}()
+	// Redirect log output to file
+	logFile, err := os.OpenFile("certstream-scout.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err == nil {
+		log.SetOutput(logFile)
+		defer logFile.Close()
+	} else {
+		fmt.Println("Warning: Could not create log file, logs will appear in console")
+	}
+
+	// Clear screen and show initial menu
+	clearScreen()
 
 	for {
 		displayMenu()
 
 		input, err := reader.ReadString('\n')
 		if err != nil {
-			log.Printf("Error reading input: %v", err)
+			fmt.Printf("Error reading input: %v\n", err)
 			continue
 		}
 
@@ -677,27 +681,54 @@ func runUserInterface(ctx context.Context, cancel context.CancelFunc) {
 			stateMutex.Lock()
 			isRunning = true
 			stateMutex.Unlock()
+			clearScreen()
 			fmt.Println("Domain aggregation STARTED")
-			displayStats()
+			time.Sleep(1 * time.Second)
+			clearScreen()
 
 		case "2":
 			// Stop domain aggregation
 			stateMutex.Lock()
 			isRunning = false
 			stateMutex.Unlock()
+			clearScreen()
 			fmt.Println("Domain aggregation STOPPED")
-			displayStats()
+			time.Sleep(1 * time.Second)
+			clearScreen()
 
 		case "3":
+			// Display statistics
+			clearScreen()
+			displayStats()
+			reader.ReadString('\n') // Wait for Enter key
+			clearScreen()
+
+		case "4":
 			// Quit application
+			clearScreen()
 			fmt.Println("Shutting down...")
 			cancel()
 			return
 
 		default:
+			clearScreen()
 			fmt.Println("Invalid option, please try again")
+			time.Sleep(1 * time.Second)
+			clearScreen()
 		}
 	}
+}
+
+// clearScreen clears the terminal screen
+func clearScreen() {
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("cmd", "/c", "cls")
+	} else {
+		cmd = exec.Command("clear")
+	}
+	cmd.Stdout = os.Stdout
+	cmd.Run()
 }
 
 // displayMenu shows the user interface menu
@@ -705,8 +736,9 @@ func displayMenu() {
 	fmt.Println("\n========= Domain Analyzer Menu =========")
 	fmt.Println("1. Start domain aggregation")
 	fmt.Println("2. Stop domain aggregation")
-	fmt.Println("3. Quit")
-	fmt.Print("Enter your choice (1-3): ")
+	fmt.Println("3. View statistics")
+	fmt.Println("4. Quit")
+	fmt.Print("Enter your choice (1-4): ")
 }
 
 func main() {
@@ -865,6 +897,7 @@ func main() {
 	fmt.Println("======================================================")
 	fmt.Println("Starting user interface...")
 
+	// Run interactive user interface
 	runUserInterface(ctx, cancel)
 
 	// Wait for all workers to finish after context is cancelled
