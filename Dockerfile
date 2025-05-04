@@ -47,5 +47,6 @@ ENV TZ=UTC
 # Expose necessary ports
 EXPOSE 8080
 
+
 # Set the entrypoint
 ENTRYPOINT ["/app/entrypoint.sh"]
