@@ -26,7 +26,7 @@ This tool opens a websocket connection to [Certstream Server Go](https://github.
 git clone https://github.com/derekrgreene/certstream-scout.git
 cd certstream-scout
 
-# Create a .env file with your configurationx
+# Create a .env file with your configuration
 cp .env.example .env
 # Edit .env with your preferred settings
 
