@@ -43,10 +43,6 @@ services:
       dockerfile: Dockerfile
     volumes:
       - ./ctlog_data:/app/ctlog_data
-    environment:
-      - DOMAIN_WHOIS_RATE=1s
-      - IP_WHOIS_RATE=1s
-      - AUTO_START=false
     env_file:
       - .env
     depends_on:
