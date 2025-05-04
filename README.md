@@ -13,6 +13,7 @@ This tool opens a websocket connection to [Certstream Server Go](https://github.
 - Distributed processing with NATS message broker
 - Configurable worker count for parallel processing
 - Results saved as structured JSON files
+- Automatic startup with environment-based configuration
 
 ## 🔧 Requirements
 
@@ -25,43 +26,59 @@ This tool opens a websocket connection to [Certstream Server Go](https://github.
 git clone https://github.com/derekrgreene/certstream-scout.git
 cd certstream-scout
 
-# Build container images
-docker-compose build
+# Create a .env file with your configuration (optional)
+cp .env.example .env
+# Edit .env with your preferred settings
 
-# Start all services
-docker-compose up -d
+# Build and start container images
+docker-compose up -d build
+
+# Access Certstream-Scout menu
+docker-compose run --rm certstream-scout
 ```
 
 ## ⚙️ Configuration
 
-Connect to Certstream-Scout container and start app
-```bash
-docker exec -it certstream-scout_certstream-scout_1 /bin/sh
+### Environment Variables
 
-# Once connected run 
-./entrypoint.sh
-```
-
-The application can be configured using command-line flags:
+You can configure the application using environment variables in a `.env` file or directly in `docker-compose.yml`. Here are all available options:
 
 ```bash
-# Run with default settings
-./certstream-scout
+# Certstream and NATS Configuration
+CERTSTREAM_URL=ws://certstream:8080/domains-only/
+NATS_URL=nats://nats:4222
 
-# Run with custom settings
-./certstream-scout -certstream ws://your-certstream-server:8080/domains-only/ -dns 1.1.1.1:53 -nats nats://your-nats-server:4222 -workers 50
+# DNS Configuration
+DNS_SERVER=1.1.1.1:53
+DNS_WORKERS=50
+
+# WHOIS Configuration
+WHOIS_WORKERS=50
+DOMAIN_WHOIS_RATE=1s
+IP_WHOIS_RATE=1s
+WHOIS_CACHE_TTL=168h
+
+# Cache and Output Configuration
+OUTPUT_DIR=ctlog_data
+CACHE_TTL=24h
+
+# Optional: Specify WHOIS IPs for rate limiting
+# WHOIS_IPS=
 ```
 
-### Available flags:
+### Available Configuration Options
 
-- `-certstream`: Certstream WebSocket URL (default: `ws://localhost:8080/domains-only/`)
-- `-dns`: DNS server to use for lookups (default: `8.8.8.8:53`)
-- `-nats`: NATS server URL (default: `nats://localhost:4222`)
-- `-workers`: Number of worker goroutines (default: `500`)
-- `cache-ttl`: Time to keep domains in cache to avoid duplicates (default: `24` hours)
-- `domain-whois-rate`: Time between domain WHOIS queries (default: `500` ms)
-- `ip-whois-rate`: Time between IP WHOIS queries (default: 1ms)
-- `whois-cache-ttl`: Time to keep WHOIS results in cache (default: `168` hours / 7 days)
+- `CERTSTREAM_URL`: Certstream WebSocket URL
+- `NATS_URL`: NATS server URL
+- `DNS_SERVER`: DNS server to use for lookups
+- `DNS_WORKERS`: Number of DNS worker goroutines
+- `WHOIS_WORKERS`: Number of WHOIS worker goroutines
+- `WHOIS_IPS`: (Optional) Comma-separated list of IPs for WHOIS workers. If not provided, WHOIS lookups will use the default system IP.
+- `DOMAIN_WHOIS_RATE`: Time between domain WHOIS queries
+- `IP_WHOIS_RATE`: Time between IP WHOIS queries
+- `WHOIS_CACHE_TTL`: Time to keep WHOIS results in cache
+- `OUTPUT_DIR`: Directory to store output files
+- `CACHE_TTL`: Time to keep domains in cache to avoid duplicates
 
 ## 📂 Output Format
 
@@ -87,11 +104,31 @@ Results are saved as JSON files in the `ctlog_data` directory. Each file contain
 
 ## 🏛️ Architecture
 
-The application consists of three main components:
+The application consists of four main components:
 
-1. **Certstream Client**: Connects to the Certstream server, receives domain entries, and publishes them to NATS.
-2. **DNS / WHOIS Resolvers**: Multiple worker goroutines that consume domain messages from NATS and perform DNS and WHOIS lookups.
-3. **Result Saver**: Consumes processed domain information and saves it to JSON files.
+1. **Certstream Client**: 
+   - Connects to the Certstream server via WebSocket
+   - Receives domain entries from certificate transparency logs
+   - Normalizes and filters domains
+   - Publishes domains to NATS for processing
+
+2. **DNS Resolvers**:
+   - Multiple worker goroutines that consume domain messages from NATS
+   - Perform parallel DNS lookups (A, AAAA, MX, TXT, CAA, SOA records)
+   - Cache results to avoid duplicate lookups
+   - Publish enriched domain data to WHOIS processing queue
+
+3. **WHOIS Resolvers**:
+   - Multiple worker goroutines with dedicated IP addresses
+   - Perform domain and IP WHOIS lookups with rate limiting
+   - Cache WHOIS results to avoid duplicate queries
+   - Update domain information with WHOIS data
+
+4. **Result Saver**:
+   - Handles concurrent file access with mutex locks
+   - Saves processed domain information to JSON files
+   - Maintains data consistency with file locking
+   - Organizes output by domain name
 
 ## 🔄 Message Flow
 
@@ -104,6 +141,10 @@ Certstream Server → Certstream Client → NATS → DNS / WHOIS Resolvers → R
 - Check if the Certstream server is running and accessible
 - Verify NATS server is running
 - Check logs for any connection or processing errors
+- Ensure all required environment variables are set correctly
+- Verify the output directory has proper permissions
+- Monitor WHOIS rate limits and adjust configuration if needed
+- Check for DNS resolution issues with the configured DNS server
 
 ## 📝 License
 

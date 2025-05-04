@@ -6,39 +6,46 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"os"
-	"os/exec"
 	"os/signal"
-	"runtime"
+	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
-	"github.com/gorilla/websocket"  // For websocket connection
-	"github.com/likexian/whois"     // For WHOIS resolution
-	"github.com/miekg/dns"          // For DNS resolution
-	"github.com/nats-io/nats.go"    // For NATS message broker/server
-	"github.com/patrickmn/go-cache" // For caching
-	"golang.org/x/net/publicsuffix" // Public suffix list for proper domain extraction
-	"golang.org/x/sys/unix"         // For non-blocking IO on Unix
-	"golang.org/x/time/rate"        // For rate limiting
+	"github.com/gorilla/websocket"
+	"github.com/likexian/whois"
+	"github.com/miekg/dns"
+	"github.com/nats-io/nats.go"
+	"github.com/patrickmn/go-cache"
+	"golang.org/x/net/publicsuffix"
+	"golang.org/x/time/rate"
 )
 
 const (
 	pingInterval      = 30 * time.Second
-	numWorkers        = 500 // Number of worker goroutines for DNS/WHOIS resolution
-	dnsTimeout        = 5 * time.Second
-	channelBufferSize = 10000 // Buffer for high throughput
+	numWorkers        = 50              // Number of worker goroutines for DNS/WHOIS resolution
+	dnsTimeout        = 5 * time.Second // Increased timeout for DNS queries
+	dnsRetries        = 3               // Number of retries for DNS queries
+	channelBufferSize = 10000           // Buffer for high throughput
 )
+
+// WHOISWorkerConfig represents configuration for a WHOIS worker
+type WHOISWorkerConfig struct {
+	IPAddress     string
+	DomainLimiter *rate.Limiter // Rate limiter for domain WHOIS queries
+	IPLimiter     *rate.Limiter // Rate limiter for IP WHOIS queries
+}
 
 // Default values, can be overridden by cli flags
 var (
 	certstreamURL = "ws://localhost:8080/domains-only/"
-	dnsServer     = "8.8.8.8:53"
+	dnsServer     = "1.1.1.1:53" // Using Cloudflare's DNS server
 	natsURL       = "nats://localhost:4222"
-	streamName    = "CERTSTREAM"
 	subjectName   = "certstream.domains"
 	consumerGroup = "domain-processors"
 	outputDir     = "ctlog_data"
@@ -47,13 +54,12 @@ var (
 	domainCache = cache.New(cacheTTL, 1*time.Hour)
 	cacheMutex  = &sync.Mutex{} // Mutex to avoid race conditions on the cache
 
-	// Rate limiters for WHOIS queries
-	domainWhoisLimiter = rate.NewLimiter(rate.Every(5*time.Second), 1)  // 1 query per 5 seconds
-	ipWhoisLimiter     = rate.NewLimiter(rate.Every(10*time.Second), 1) // 1 query per 10 seconds
-
 	// WHOIS cache with longer expiration (1 week)
-	whoisCache      = cache.New(7*24*time.Hour, 1*time.Hour) // WHOIS results cache
-	whoisCacheMutex = &sync.Mutex{}                          // Mutex for WHOIS cache
+	whoisCache = cache.New(7*24*time.Hour, 1*time.Hour) // WHOIS results cache
+
+	// File locks for concurrent access
+	fileLocks     = make(map[string]*sync.Mutex)
+	fileLockMutex = &sync.Mutex{}
 
 	// Application state
 	isRunning   bool
@@ -61,6 +67,38 @@ var (
 	totalQueued int64
 	processing  int64
 	statsChan   = make(chan struct{}, 1) // Signal channel for stats updates
+
+	// WHOIS worker configuration
+	whoisWorkerIPs     []string // List of IPs for WHOIS workers
+	whoisWorkerConfigs []WHOISWorkerConfig
+	whoisSubjectName   = "certstream.whois" // New NATS subject for WHOIS processing
+
+	// Auto-start flag
+	autoStart = flag.Bool("auto-start", false, "Automatically start processing without waiting for user input")
+
+	// Status tracking
+	domainsCollected      int64
+	domainsDNSProcessed   int64
+	domainsWHOISProcessed int64
+	domainsFullyProcessed int64
+	statusMutex           sync.Mutex
+
+	// Control flags
+	isCollecting bool        = true
+	controlChan  chan string = make(chan string, 1)
+
+	// Command line flags
+	certstreamURLFlag   = flag.String("certstream", certstreamURL, "Certstream WebSocket URL")
+	dnsServerFlag       = flag.String("dns", dnsServer, "DNS server to use for lookups")
+	dnsWorkersFlag      = flag.Int("dns-workers", numWorkers, "Number of DNS worker goroutines")
+	whoisWorkersFlag    = flag.Int("whois-workers", 10, "Number of WHOIS worker goroutines")
+	natsURLFlag         = flag.String("nats", natsURL, "NATS server URL")
+	cacheTTLFlag        = flag.Duration("cache-ttl", cacheTTL, "Time to keep domains in cache (to avoid duplicates)")
+	outputDirFlag       = flag.String("output-dir", outputDir, "Directory to store output files")
+	whoisIPsFlag        = flag.String("whois-ips", "", "Comma-separated list of IPs for WHOIS workers")
+	domainWhoisRateFlag = flag.Duration("domain-whois-rate", 1*time.Second, "Time between domain WHOIS queries")
+	ipWhoisRateFlag     = flag.Duration("ip-whois-rate", 1*time.Second, "Time between IP WHOIS queries")
+	whoisCacheTTLFlag   = flag.Duration("whois-cache-ttl", 7*24*time.Hour, "Time to keep WHOIS results in cache")
 )
 
 // DomainEntry represents the domain information from certstreams /domain-only endpoint
@@ -72,15 +110,15 @@ type DomainEntry struct {
 // DomainInfo represents processed domain information
 type DomainInfo struct {
 	Domain      string            `json:"domain"`
-	RootDomain  string            `json:"root_domain"` // Added root domain field
+	RootDomain  string            `json:"root_domain"`
 	A           []string          `json:"a_records"`
 	AAAA        []string          `json:"aaaa_records"`
 	MX          []string          `json:"mx_records"`
 	TXT         []string          `json:"txt_records"`
 	CAA         []string          `json:"caa_records"`
 	SOA         string            `json:"soa_record"`
-	DomainWhois string            `json:"domain_whois"`
-	IPWhois     map[string]string `json:"ip_whois"`
+	DomainWhois string            `json:"domain_whois,omitempty"` // Make WHOIS fields optional
+	IPWhois     map[string]string `json:"ip_whois,omitempty"`
 	Timestamp   time.Time         `json:"timestamp"`
 }
 
@@ -109,15 +147,15 @@ func normalizeDomain(domain string) string {
 }
 
 // retryWhois performs WHOIS query with rate limiting and exponential backoff
-func retryWhois(domain string, isIP bool, maxRetries int) (string, error) {
+func retryWhois(domain string, isIP bool, maxRetries int, config WHOISWorkerConfig) (string, error) {
 	var whoisResult string
 	var err error
 	var limiter *rate.Limiter
 
 	if isIP {
-		limiter = ipWhoisLimiter
+		limiter = config.IPLimiter
 	} else {
-		limiter = domainWhoisLimiter
+		limiter = config.DomainLimiter
 	}
 
 	// Initial backoff time
@@ -154,35 +192,6 @@ func retryWhois(domain string, isIP bool, maxRetries int) (string, error) {
 	return "", fmt.Errorf("exceeded maximum retries for WHOIS query: %w", err)
 }
 
-// getWhoisWithCache fetches WHOIS info from cache or performs lookup with rate limiting
-func getWhoisWithCache(domain string, isIP bool, maxRetries int) (string, error) {
-	// Check cache first
-	whoisCacheMutex.Lock()
-	cacheKey := domain
-	if isIP {
-		cacheKey = "ip:" + domain // Prefix to distinguish from domain lookups
-	}
-
-	if result, found := whoisCache.Get(cacheKey); found {
-		whoisCacheMutex.Unlock()
-		return result.(string), nil
-	}
-	whoisCacheMutex.Unlock()
-
-	// Not in cache, perform lookup
-	result, err := retryWhois(domain, isIP, maxRetries)
-	if err != nil {
-		return "", err
-	}
-
-	// Add to cache
-	whoisCacheMutex.Lock()
-	whoisCache.Set(cacheKey, result, cache.DefaultExpiration)
-	whoisCacheMutex.Unlock()
-
-	return result, nil
-}
-
 // certstreamClient connects to the certstream server and publishes domains to NATS message broker
 func certstreamClient(ctx context.Context, js nats.JetStreamContext) error {
 	log.Println("Connecting to certstream server at", certstreamURL)
@@ -193,6 +202,8 @@ func certstreamClient(ctx context.Context, js nats.JetStreamContext) error {
 	}
 	defer c.Close()
 
+	log.Println("Successfully connected to certstream server")
+
 	// Must ping certstream server every 30 seconds
 	ticker := time.NewTicker(pingInterval)
 	defer ticker.Stop()
@@ -201,20 +212,33 @@ func certstreamClient(ctx context.Context, js nats.JetStreamContext) error {
 	for {
 		select {
 		case <-ctx.Done():
+			log.Println("Certstream client context cancelled, shutting down")
 			return nil
 		case <-ticker.C:
 			// Send ping message
 			if err := c.WriteMessage(websocket.PingMessage, []byte{}); err != nil {
+				log.Printf("Ping error: %v", err)
 				return fmt.Errorf("ping error: %w", err)
 			}
+			log.Println("Sent ping to certstream server")
 		default:
+			// Check if collection is paused
+			statusMutex.Lock()
+			if !isCollecting {
+				statusMutex.Unlock()
+				log.Println("Collection paused, waiting...")
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			statusMutex.Unlock()
+
 			// Check if processing is paused
 			stateMutex.Lock()
 			currentlyRunning := isRunning
 			stateMutex.Unlock()
 
 			if !currentlyRunning {
-				// If paused, just wait a bit and check again
+				log.Println("Processing paused, waiting...")
 				time.Sleep(500 * time.Millisecond)
 				continue
 			}
@@ -222,8 +246,11 @@ func certstreamClient(ctx context.Context, js nats.JetStreamContext) error {
 			// Read message from WebSocket
 			_, message, err := c.ReadMessage()
 			if err != nil {
+				log.Printf("Error reading message: %v", err)
 				return fmt.Errorf("read error: %w", err)
 			}
+
+			log.Printf("Received message from certstream: %s", string(message))
 
 			// Parse the message
 			var entry DomainEntry
@@ -233,8 +260,11 @@ func certstreamClient(ctx context.Context, js nats.JetStreamContext) error {
 			}
 
 			if entry.MessageType != "dns_entries" {
+				log.Printf("Skipping non-dns_entries message type: %s", entry.MessageType)
 				continue
 			}
+
+			log.Printf("Processing %d domains from certstream", len(entry.Data))
 
 			// Track normalized domains to avoid duplicates within the same certificate
 			processedDomains := make(map[string]struct{})
@@ -288,21 +318,292 @@ func certstreamClient(ctx context.Context, js nats.JetStreamContext) error {
 
 				log.Printf("Published domain to NATS: %s", normalizedDomain)
 			}
+
+			// Update collected count
+			statusMutex.Lock()
+			domainsCollected += int64(len(entry.Data))
+			statusMutex.Unlock()
 		}
 	}
 }
 
-// dnsResolver performs DNS and WHOIS lookups for domains
-func dnsResolver(ctx context.Context, workerID int, js nats.JetStreamContext, resultChan chan<- DomainInfo) error {
-	log.Printf("Worker %d starting", workerID)
+// lookupWithRetry performs DNS lookup with retries and better error handling
+func lookupWithRetry(domain string, client *dns.Client, msg *dns.Msg) (*dns.Msg, error) {
+	var lastErr error
 
-	// Create DNS client
-	dnsClient := &dns.Client{
-		Timeout: dnsTimeout,
+	// Try TCP first
+	client.Net = "tcp"
+	for i := 0; i < dnsRetries; i++ {
+		log.Printf("DNS TCP query attempt %d/%d for %s", i+1, dnsRetries, domain)
+		r, rtt, err := client.Exchange(msg, dnsServer)
+		if err == nil {
+			log.Printf("DNS TCP query successful for %s (RTT: %v)", domain, rtt)
+			if r != nil && len(r.Answer) == 0 && r.Rcode == dns.RcodeSuccess {
+				log.Printf("Warning: Empty answer section with RcodeSuccess for %s", domain)
+			}
+			return r, nil
+		}
+		lastErr = err
+		log.Printf("DNS TCP query attempt %d failed for %s: %v", i+1, domain, err)
+
+		// Add jitter to retry delay
+		jitter := time.Duration(rand.Int63n(int64(100 * time.Millisecond)))
+		time.Sleep(100*time.Millisecond + jitter)
 	}
 
+	// If TCP failed, try UDP
+	log.Printf("TCP lookups failed for %s, falling back to UDP", domain)
+	client.Net = "udp"
+	for i := 0; i < dnsRetries; i++ {
+		log.Printf("DNS UDP query attempt %d/%d for %s", i+1, dnsRetries, domain)
+		r, rtt, err := client.Exchange(msg, dnsServer)
+		if err == nil {
+			log.Printf("DNS UDP query successful for %s (RTT: %v)", domain, rtt)
+			if r != nil && len(r.Answer) == 0 && r.Rcode == dns.RcodeSuccess {
+				log.Printf("Warning: Empty answer section with RcodeSuccess for %s", domain)
+			}
+			return r, nil
+		}
+		lastErr = err
+		log.Printf("DNS UDP query attempt %d failed for %s: %v", i+1, domain, err)
+
+		// Add jitter to retry delay
+		jitter := time.Duration(rand.Int63n(int64(100 * time.Millisecond)))
+		time.Sleep(100*time.Millisecond + jitter)
+	}
+
+	return nil, fmt.Errorf("all DNS query attempts (TCP and UDP) failed for %s: %w", domain, lastErr)
+}
+
+// lookupAWithClient performs DNS lookup for A records
+func lookupAWithClient(domain string, client *dns.Client) ([]string, error) {
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(domain), dns.TypeA)
+	m.RecursionDesired = true
+	m.SetEdns0(4096, true)
+
+	log.Printf("Looking up A records for %s using server %s", domain, dnsServer)
+	r, err := lookupWithRetry(domain, client, m)
+	if err != nil {
+		log.Printf("A record lookup error for %s after %d retries: %v", domain, dnsRetries, err)
+		return []string{}, err
+	}
+
+	if r.Rcode != dns.RcodeSuccess {
+		log.Printf("A record lookup failed for %s with Rcode: %d (%s)", domain, r.Rcode, dns.RcodeToString[r.Rcode])
+		return []string{}, fmt.Errorf("A record lookup failed with Rcode: %d (%s)", r.Rcode, dns.RcodeToString[r.Rcode])
+	}
+
+	// Log raw response
+	log.Printf("Raw DNS response for %s A records: %+v", domain, r)
+
+	var records []string
+	for _, ans := range r.Answer {
+		log.Printf("Processing answer for %s: %T %+v", domain, ans, ans)
+		if a, ok := ans.(*dns.A); ok {
+			records = append(records, a.A.String())
+			log.Printf("Found A record for %s: %s", domain, a.A.String())
+		} else {
+			log.Printf("Unexpected record type in A lookup for %s: %T", domain, ans)
+		}
+	}
+
+	if len(records) == 0 {
+		log.Printf("No A records found for %s (Answer section length: %d)", domain, len(r.Answer))
+		return []string{}, nil
+	}
+
+	log.Printf("Successfully found %d A records for %s: %v", len(records), domain, records)
+	return records, nil
+}
+
+func lookupAAAAWithClient(domain string, client *dns.Client) ([]string, error) {
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(domain), dns.TypeAAAA)
+	m.RecursionDesired = true
+	m.SetEdns0(4096, true)
+
+	r, err := lookupWithRetry(domain, client, m)
+	if err != nil {
+		log.Printf("AAAA record lookup error for %s after %d retries: %v", domain, dnsRetries, err)
+		return []string{}, err
+	}
+
+	if r.Rcode != dns.RcodeSuccess {
+		log.Printf("AAAA record lookup failed for %s with Rcode: %d", domain, r.Rcode)
+		return []string{}, fmt.Errorf("AAAA record lookup failed with Rcode: %d", r.Rcode)
+	}
+
+	var records []string
+	for _, ans := range r.Answer {
+		if aaaa, ok := ans.(*dns.AAAA); ok {
+			records = append(records, aaaa.AAAA.String())
+			log.Printf("Found AAAA record for %s: %s", domain, aaaa.AAAA.String())
+		}
+	}
+
+	if len(records) == 0 {
+		log.Printf("No AAAA records found for %s", domain)
+		return []string{}, nil
+	}
+
+	return records, nil
+}
+
+func lookupMXWithClient(domain string, client *dns.Client) ([]string, error) {
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(domain), dns.TypeMX)
+	m.RecursionDesired = true
+	m.SetEdns0(4096, true)
+
+	r, err := lookupWithRetry(domain, client, m)
+	if err != nil {
+		log.Printf("MX record lookup error for %s after %d retries: %v", domain, dnsRetries, err)
+		return []string{}, err
+	}
+
+	if r.Rcode != dns.RcodeSuccess {
+		log.Printf("MX record lookup failed for %s with Rcode: %d", domain, r.Rcode)
+		return []string{}, fmt.Errorf("MX record lookup failed with Rcode: %d", r.Rcode)
+	}
+
+	var records []string
+	for _, ans := range r.Answer {
+		if mx, ok := ans.(*dns.MX); ok {
+			record := fmt.Sprintf("%d %s", mx.Preference, mx.Mx)
+			records = append(records, record)
+			log.Printf("Found MX record for %s: %s", domain, record)
+		}
+	}
+
+	if len(records) == 0 {
+		log.Printf("No MX records found for %s", domain)
+		return []string{}, nil
+	}
+
+	return records, nil
+}
+
+func lookupTXTWithClient(domain string, client *dns.Client) ([]string, error) {
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(domain), dns.TypeTXT)
+	m.RecursionDesired = true
+	m.SetEdns0(4096, true)
+
+	r, err := lookupWithRetry(domain, client, m)
+	if err != nil {
+		log.Printf("TXT record lookup error for %s after %d retries: %v", domain, dnsRetries, err)
+		return []string{}, err
+	}
+
+	if r.Rcode != dns.RcodeSuccess {
+		log.Printf("TXT record lookup failed for %s with Rcode: %d", domain, r.Rcode)
+		return []string{}, fmt.Errorf("TXT record lookup failed with Rcode: %d", r.Rcode)
+	}
+
+	var records []string
+	for _, ans := range r.Answer {
+		if txt, ok := ans.(*dns.TXT); ok {
+			record := strings.Join(txt.Txt, " ")
+			records = append(records, record)
+			log.Printf("Found TXT record for %s: %s", domain, record)
+		}
+	}
+
+	if len(records) == 0 {
+		log.Printf("No TXT records found for %s", domain)
+		return []string{}, nil
+	}
+
+	return records, nil
+}
+
+func lookupCAAWithClient(domain string, client *dns.Client) ([]string, error) {
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(domain), dns.TypeCAA)
+	m.RecursionDesired = true
+	m.SetEdns0(4096, true)
+
+	r, err := lookupWithRetry(domain, client, m)
+	if err != nil {
+		log.Printf("CAA record lookup error for %s after %d retries: %v", domain, dnsRetries, err)
+		return []string{}, err
+	}
+
+	if r.Rcode != dns.RcodeSuccess {
+		log.Printf("CAA record lookup failed for %s with Rcode: %d", domain, r.Rcode)
+		return []string{}, fmt.Errorf("CAA record lookup failed with Rcode: %d", r.Rcode)
+	}
+
+	var records []string
+	for _, ans := range r.Answer {
+		if caa, ok := ans.(*dns.CAA); ok {
+			record := fmt.Sprintf("%d %s \"%s\"", caa.Flag, caa.Tag, caa.Value)
+			records = append(records, record)
+			log.Printf("Found CAA record for %s: %s", domain, record)
+		}
+	}
+
+	if len(records) == 0 {
+		log.Printf("No CAA records found for %s", domain)
+		return []string{}, nil
+	}
+
+	return records, nil
+}
+
+func lookupSOAWithClient(domain string, client *dns.Client) (string, error) {
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(domain), dns.TypeSOA)
+	m.RecursionDesired = true
+	m.SetEdns0(4096, true)
+
+	r, err := lookupWithRetry(domain, client, m)
+	if err != nil {
+		log.Printf("SOA record lookup error for %s after %d retries: %v", domain, dnsRetries, err)
+		return "", err
+	}
+
+	if r.Rcode != dns.RcodeSuccess {
+		log.Printf("SOA record lookup failed for %s with Rcode: %d", domain, r.Rcode)
+		return "", fmt.Errorf("SOA record lookup failed with Rcode: %d", r.Rcode)
+	}
+
+	for _, ans := range r.Answer {
+		if soa, ok := ans.(*dns.SOA); ok {
+			record := fmt.Sprintf("%s %s %d %d %d %d %d",
+				soa.Ns, soa.Mbox, soa.Serial, soa.Refresh,
+				soa.Retry, soa.Expire, soa.Minttl)
+			log.Printf("Found SOA record for %s: %s", domain, record)
+			return record, nil
+		}
+	}
+
+	log.Printf("No SOA record found for %s", domain)
+	return "", nil
+}
+
+// getFileLock returns a mutex for a specific file, creating it if it doesn't exist
+func getFileLock(filename string) *sync.Mutex {
+	fileLockMutex.Lock()
+	defer fileLockMutex.Unlock()
+
+	if lock, exists := fileLocks[filename]; exists {
+		return lock
+	}
+
+	lock := &sync.Mutex{}
+	fileLocks[filename] = lock
+	return lock
+}
+
+// whoisResolver performs WHOIS lookups for domains using a specific IP address
+func whoisResolver(ctx context.Context, workerID int, js nats.JetStreamContext, config WHOISWorkerConfig) error {
+	log.Printf("WHOIS Worker %d starting with IP %s", workerID, config.IPAddress)
+
+	// Create subscription to WHOIS stream
 	sub, err := js.PullSubscribe(
-		subjectName,
+		whoisSubjectName,
 		consumerGroup,
 		nats.AckExplicit(),
 		nats.MaxDeliver(3),
@@ -324,527 +625,372 @@ func dnsResolver(ctx context.Context, workerID int, js nats.JetStreamContext, re
 					time.Sleep(100 * time.Millisecond)
 					continue
 				}
-				log.Printf("Worker %d error fetching messages: %v", workerID, err)
+				log.Printf("WHOIS Worker %d error fetching messages: %v", workerID, err)
 				time.Sleep(time.Second) // Back off on errors
 				continue
 			}
 
 			// Process messages
 			for _, msg := range msgs {
-				domain := string(msg.Data)
-
-				// Check if domain is already in cache with mutex lock
-				cacheMutex.Lock()
-				_, found := domainCache.Get(domain)
-				if found {
-					cacheMutex.Unlock()
-					log.Printf("Worker %d skipping already processed domain: %s", workerID, domain)
-					if err := msg.Ack(); err != nil {
-						log.Printf("Worker %d error acknowledging skipped message: %v", workerID, err)
-					}
-
-					// Update statistics for skipped domain
-					stateMutex.Lock()
-					processing--
-					stateMutex.Unlock()
-
-					// Signal stats update
-					select {
-					case statsChan <- struct{}{}:
-					default:
-						// Channel already has an update pending
-					}
-
+				var info DomainInfo
+				if err := json.Unmarshal(msg.Data, &info); err != nil {
+					log.Printf("WHOIS Worker %d error unmarshaling domain info: %v", workerID, err)
 					continue
 				}
 
-				// Mark the domain as being processed to prevent other workers from processing it
-				domainCache.Set(domain, true, cache.DefaultExpiration)
-				cacheMutex.Unlock()
+				// Find the file for this domain
+				filename := fmt.Sprintf("%s/%s.json", outputDir, strings.Replace(info.Domain, ".", "_", -1))
 
-				log.Printf("Worker %d processing domain: %s", workerID, domain)
+				// Get the file lock
+				fileLock := getFileLock(filename)
+				fileLock.Lock()
+				defer fileLock.Unlock()
 
-				// Extract the root domain for WHOIS queries
-				rootDomain := extractRootDomain(domain)
-				log.Printf("Worker %d extracted root domain: %s from: %s", workerID, rootDomain, domain)
-
-				info := DomainInfo{
-					Domain:     domain,
-					RootDomain: rootDomain,
-					Timestamp:  time.Now(),
-					A:          []string{},
-					AAAA:       []string{},
-					MX:         []string{},
-					TXT:        []string{},
-					CAA:        []string{},
-					SOA:        "",
-					IPWhois:    make(map[string]string),
+				// Read existing file
+				existingData, err := os.ReadFile(filename)
+				if err != nil {
+					log.Printf("WHOIS Worker %d error reading file %s: %v", workerID, filename, err)
+					continue
 				}
 
-				// Perform A record lookup
-				aRecords, err := lookupA(dnsClient, dnsServer, domain)
-				if err == nil && len(aRecords) > 0 {
-					info.A = aRecords
+				// Unmarshal existing data
+				var existingInfo DomainInfo
+				if err := json.Unmarshal(existingData, &existingInfo); err != nil {
+					log.Printf("WHOIS Worker %d error unmarshaling existing data: %v", workerID, err)
+					continue
 				}
 
-				// Perform AAAA record lookup
-				aaaaRecords, err := lookupAAAA(dnsClient, dnsServer, domain)
-				if err == nil && len(aaaaRecords) > 0 {
-					info.AAAA = aaaaRecords
+				// Initialize IPWhois map if it's nil
+				if existingInfo.IPWhois == nil {
+					existingInfo.IPWhois = make(map[string]string)
 				}
 
-				// Perform MX record lookup
-				mxRecords, err := lookupMX(dnsClient, dnsServer, domain)
-				if err == nil && len(mxRecords) > 0 {
-					info.MX = mxRecords
-				}
+				// Perform domain WHOIS lookup on the root domain
+				log.Printf("WHOIS Worker %d performing WHOIS lookup on root domain %s",
+					workerID, info.RootDomain)
 
-				// Perform TXT record lookup
-				txtRecords, err := lookupTXT(dnsClient, dnsServer, domain)
-				if err == nil && len(txtRecords) > 0 {
-					info.TXT = txtRecords
-				}
-
-				// Perform CAA record lookup
-				caaRecords, err := lookupCAA(dnsClient, dnsServer, domain)
-				if err == nil && len(caaRecords) > 0 {
-					info.CAA = caaRecords
-				}
-
-				// Perform SOA record lookup
-				soaRecord, err := lookupSOA(dnsClient, dnsServer, domain)
+				// Use the rate-limited WHOIS lookup with worker's IP
+				domainWhois, err := retryWhois(info.RootDomain, false, 3, config)
 				if err == nil {
-					info.SOA = soaRecord
-				}
-
-				// Perform domain WHOIS lookup on the root domain instead of the subdomain
-				log.Printf("Worker %d performing WHOIS lookup on root domain %s instead of full domain %s",
-					workerID, rootDomain, domain)
-
-				// Use the rate-limited and cached WHOIS lookup
-				domainWhois, err := getWhoisWithCache(rootDomain, false, 3) // 3 retries max
-				if err == nil {
-					info.DomainWhois = domainWhois
-					log.Printf("Worker %d successfully retrieved WHOIS data for root domain %s", workerID, rootDomain)
+					existingInfo.DomainWhois = domainWhois
+					log.Printf("WHOIS Worker %d successfully retrieved WHOIS data for root domain %s", workerID, info.RootDomain)
 				} else {
-					log.Printf("Worker %d error performing WHOIS for root domain %s: %v", workerID, rootDomain, err)
+					log.Printf("WHOIS Worker %d error performing WHOIS for root domain %s: %v", workerID, info.RootDomain, err)
 				}
 
-				// Perform IP WHOIS lookups for each A record with rate limiting
+				// Perform IP WHOIS lookups for each A record
 				for _, ip := range info.A {
-					ipWhois, err := getWhoisWithCache(ip, true, 2) // 2 retries max for IP WHOIS
+					// Skip if we already have WHOIS data for this IP
+					if _, exists := existingInfo.IPWhois[ip]; exists {
+						continue
+					}
+
+					ipWhois, err := retryWhois(ip, true, 2, config)
 					if err == nil {
-						info.IPWhois[ip] = ipWhois
+						existingInfo.IPWhois[ip] = ipWhois
+						log.Printf("WHOIS Worker %d successfully retrieved WHOIS data for IP %s", workerID, ip)
 					} else {
-						log.Printf("Worker %d error performing WHOIS for IP %s: %v", workerID, ip, err)
+						log.Printf("WHOIS Worker %d error performing WHOIS for IP %s: %v", workerID, ip, err)
 					}
 				}
 
-				// Send the result for saving
-				select {
-				case resultChan <- info:
-					// Successfully sent to result channel
-					if err := msg.Ack(); err != nil {
-						log.Printf("Worker %d error acknowledging message: %v", workerID, err)
-					}
-					log.Printf("Worker %d successfully processed domain: %s", workerID, domain)
-
-					// Update statistics
-					stateMutex.Lock()
-					processing--
-					stateMutex.Unlock()
-
-					// Signal stats update
-					select {
-					case statsChan <- struct{}{}:
-					default:
-						// Channel already has an update pending
-					}
-
-				case <-ctx.Done():
-					return nil
-				default:
-					// If result channel is full, retry later
-					if err := msg.NakWithDelay(5 * time.Second); err != nil {
-						log.Printf("Worker %d error negative-acknowledging message: %v", workerID, err)
-					}
-					log.Printf("Worker %d: Result channel is full, will retry processing domain %s later", workerID, domain)
+				// Update the file with WHOIS data
+				prettyJSON, err := json.MarshalIndent(existingInfo, "", "  ")
+				if err != nil {
+					log.Printf("WHOIS Worker %d error marshaling updated JSON: %v", workerID, err)
+					continue
 				}
+
+				err = os.WriteFile(filename, prettyJSON, 0644)
+				if err != nil {
+					log.Printf("WHOIS Worker %d error writing updated result to file: %v", workerID, err)
+					continue
+				}
+
+				log.Printf("WHOIS Worker %d updated file %s with WHOIS data", workerID, filename)
+
+				// Acknowledge the message
+				if err := msg.Ack(); err != nil {
+					log.Printf("WHOIS Worker %d error acknowledging message: %v", workerID, err)
+				}
+
+				// Update WHOIS processed count
+				statusMutex.Lock()
+				domainsWHOISProcessed++
+				// Only increment fully processed if we have DNS records
+				if len(existingInfo.A) > 0 || len(existingInfo.AAAA) > 0 || len(existingInfo.MX) > 0 || len(existingInfo.TXT) > 0 || len(existingInfo.CAA) > 0 || existingInfo.SOA != "" {
+					domainsFullyProcessed++
+				}
+				statusMutex.Unlock()
 			}
 		}
 	}
 }
 
-// lookupA performs DNS A record lookup
-func lookupA(client *dns.Client, server, domain string) ([]string, error) {
-	m := new(dns.Msg)
-	m.SetQuestion(dns.Fqdn(domain), dns.TypeA)
-	r, _, err := client.Exchange(m, server)
+// dnsResolver processes DNS lookups for domains
+func dnsResolver(ctx context.Context, workerID int, js nats.JetStreamContext) error {
+	log.Printf("DNS Worker %d starting", workerID)
+
+	// Create DNS client with improved configuration
+	dnsClient := &dns.Client{
+		Timeout:        dnsTimeout,
+		SingleInflight: true,
+		DialTimeout:    2 * time.Second, // Increased dial timeout
+		ReadTimeout:    2 * time.Second, // Increased read timeout
+		WriteTimeout:   2 * time.Second, // Increased write timeout
+		Net:            "udp",           // Start with UDP, will fallback to TCP if needed
+	}
+
+	// Create subscription to DNS stream
+	sub, err := js.PullSubscribe(
+		subjectName,
+		consumerGroup,
+		nats.AckExplicit(),
+		nats.MaxDeliver(3),
+	)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("subscription error: %w", err)
 	}
-
-	var records []string
-	for _, ans := range r.Answer {
-		if a, ok := ans.(*dns.A); ok {
-			records = append(records, a.A.String())
-		}
-	}
-	return records, nil
-}
-
-// lookupAAAA performs DNS AAAA record lookup
-func lookupAAAA(client *dns.Client, server, domain string) ([]string, error) {
-	m := new(dns.Msg)
-	m.SetQuestion(dns.Fqdn(domain), dns.TypeAAAA)
-	r, _, err := client.Exchange(m, server)
-	if err != nil {
-		return nil, err
-	}
-
-	var records []string
-	for _, ans := range r.Answer {
-		if aaaa, ok := ans.(*dns.AAAA); ok {
-			records = append(records, aaaa.AAAA.String())
-		}
-	}
-	return records, nil
-}
-
-// lookupMX performs DNS MX record lookup
-func lookupMX(client *dns.Client, server, domain string) ([]string, error) {
-	m := new(dns.Msg)
-	m.SetQuestion(dns.Fqdn(domain), dns.TypeMX)
-	r, _, err := client.Exchange(m, server)
-	if err != nil {
-		return nil, err
-	}
-
-	var records []string
-	for _, ans := range r.Answer {
-		if mx, ok := ans.(*dns.MX); ok {
-			records = append(records, fmt.Sprintf("%d %s", mx.Preference, mx.Mx))
-		}
-	}
-	return records, nil
-}
-
-// lookupTXT performs DNS TXT record lookup
-func lookupTXT(client *dns.Client, server, domain string) ([]string, error) {
-	m := new(dns.Msg)
-	m.SetQuestion(dns.Fqdn(domain), dns.TypeTXT)
-	r, _, err := client.Exchange(m, server)
-	if err != nil {
-		return nil, err
-	}
-
-	var records []string
-	for _, ans := range r.Answer {
-		if txt, ok := ans.(*dns.TXT); ok {
-			records = append(records, strings.Join(txt.Txt, " "))
-		}
-	}
-	return records, nil
-}
-
-// lookupCAA performs DNS CAA record lookup
-func lookupCAA(client *dns.Client, server, domain string) ([]string, error) {
-	m := new(dns.Msg)
-	m.SetQuestion(dns.Fqdn(domain), dns.TypeCAA)
-	r, _, err := client.Exchange(m, server)
-	if err != nil {
-		return nil, err
-	}
-
-	var records []string
-	for _, ans := range r.Answer {
-		if caa, ok := ans.(*dns.CAA); ok {
-			records = append(records, fmt.Sprintf("%d %s \"%s\"", caa.Flag, caa.Tag, caa.Value))
-		}
-	}
-	return records, nil
-}
-
-// lookupSOA performs DNS SOA record lookup
-func lookupSOA(client *dns.Client, server, domain string) (string, error) {
-	m := new(dns.Msg)
-	m.SetQuestion(dns.Fqdn(domain), dns.TypeSOA)
-	r, _, err := client.Exchange(m, server)
-	if err != nil {
-		return "", err
-	}
-
-	for _, ans := range r.Answer {
-		if soa, ok := ans.(*dns.SOA); ok {
-			return fmt.Sprintf("%s %s %d %d %d %d %d",
-				soa.Ns, soa.Mbox, soa.Serial, soa.Refresh,
-				soa.Retry, soa.Expire, soa.Minttl), nil
-		}
-	}
-	return "", fmt.Errorf("no SOA record found")
-}
-
-// resultSaver saves JSON results to files
-func resultSaver(ctx context.Context, resultChan <-chan DomainInfo) error {
-	log.Println("Result saver starting")
-
-	// Create output directory if it doesn't exist
-	err := os.MkdirAll(outputDir, 0755)
-	if err != nil {
-		return fmt.Errorf("error creating output directory: %w", err)
-	}
+	defer sub.Unsubscribe()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case info, ok := <-resultChan:
-			if !ok {
-				return nil // Channel closed
-			}
-
-			// Create domain file with timestamp to avoid conflicts
-			filename := fmt.Sprintf("%s/%s_%d.json",
-				outputDir,
-				strings.Replace(info.Domain, ".", "_", -1),
-				time.Now().UnixNano())
-
-			// Pretty print the JSON
-			prettyJSON, err := json.MarshalIndent(info, "", "  ")
+		default:
+			// Pull a larger batch of messages
+			msgs, err := sub.Fetch(50, nats.MaxWait(500*time.Millisecond))
 			if err != nil {
-				log.Printf("Error pretty printing JSON: %v", err)
+				if err == nats.ErrTimeout {
+					time.Sleep(50 * time.Millisecond)
+					continue
+				}
+				log.Printf("DNS Worker %d error fetching messages: %v", workerID, err)
+				time.Sleep(500 * time.Millisecond)
 				continue
 			}
 
-			// Write to file
-			err = os.WriteFile(filename, prettyJSON, 0644)
-			if err != nil {
-				log.Printf("Error writing result to file: %v", err)
-				continue
+			// Process messages in parallel
+			var wg sync.WaitGroup
+			for _, msg := range msgs {
+				wg.Add(1)
+				go func(msg *nats.Msg) {
+					defer wg.Done()
+					domain := string(msg.Data)
+					log.Printf("DNS Worker %d processing domain: %s", workerID, domain)
+
+					// Create DomainInfo struct
+					info := DomainInfo{
+						Domain:     domain,
+						RootDomain: extractRootDomain(domain),
+						IPWhois:    make(map[string]string),
+						Timestamp:  time.Now(),
+					}
+
+					// Perform all DNS lookups in parallel
+					var lookupWg sync.WaitGroup
+					var lookupErrors []error
+					var lookupMutex sync.Mutex
+
+					// A records
+					lookupWg.Add(1)
+					go func() {
+						defer lookupWg.Done()
+						log.Printf("DNS Worker %d looking up A records for %s", workerID, domain)
+						if a, err := lookupAWithClient(domain, dnsClient); err != nil {
+							lookupMutex.Lock()
+							lookupErrors = append(lookupErrors, fmt.Errorf("A lookup error: %w", err))
+							lookupMutex.Unlock()
+						} else {
+							info.A = a
+							if len(a) > 0 {
+								log.Printf("DNS Worker %d found %d A records for %s: %v", workerID, len(a), domain, a)
+							}
+						}
+					}()
+
+					// Other records in parallel
+					recordTypes := []struct {
+						name string
+						fn   func(string, *dns.Client) ([]string, error)
+					}{
+						{"AAAA", lookupAAAAWithClient},
+						{"MX", lookupMXWithClient},
+						{"TXT", lookupTXTWithClient},
+						{"CAA", lookupCAAWithClient},
+					}
+
+					for _, rt := range recordTypes {
+						lookupWg.Add(1)
+						go func(rt struct {
+							name string
+							fn   func(string, *dns.Client) ([]string, error)
+						}) {
+							defer lookupWg.Done()
+							log.Printf("DNS Worker %d looking up %s records for %s", workerID, rt.name, domain)
+							if result, err := rt.fn(domain, dnsClient); err != nil {
+								lookupMutex.Lock()
+								lookupErrors = append(lookupErrors, fmt.Errorf("%s lookup error: %w", rt.name, err))
+								lookupMutex.Unlock()
+							} else {
+								switch rt.name {
+								case "AAAA":
+									info.AAAA = result
+									if len(result) > 0 {
+										log.Printf("DNS Worker %d found %d AAAA records for %s: %v", workerID, len(result), domain, result)
+									}
+								case "MX":
+									info.MX = result
+									if len(result) > 0 {
+										log.Printf("DNS Worker %d found %d MX records for %s: %v", workerID, len(result), domain, result)
+									}
+								case "TXT":
+									info.TXT = result
+									if len(result) > 0 {
+										log.Printf("DNS Worker %d found %d TXT records for %s: %v", workerID, len(result), domain, result)
+									}
+								case "CAA":
+									info.CAA = result
+									if len(result) > 0 {
+										log.Printf("DNS Worker %d found %d CAA records for %s: %v", workerID, len(result), domain, result)
+									}
+								}
+							}
+						}(rt)
+					}
+
+					// SOA record
+					lookupWg.Add(1)
+					go func() {
+						defer lookupWg.Done()
+						log.Printf("DNS Worker %d looking up SOA record for %s", workerID, domain)
+						if soa, err := lookupSOAWithClient(domain, dnsClient); err != nil {
+							lookupMutex.Lock()
+							lookupErrors = append(lookupErrors, fmt.Errorf("SOA lookup error: %w", err))
+							lookupMutex.Unlock()
+						} else {
+							info.SOA = soa
+							if soa != "" {
+								log.Printf("DNS Worker %d found SOA record for %s: %s", workerID, domain, soa)
+							}
+						}
+					}()
+
+					// Wait for all lookups with improved timeout handling
+					lookupTimeout := dnsTimeout * time.Duration(len(recordTypes)+2) // Account for all record types plus buffer
+					done := make(chan struct{})
+					go func() {
+						lookupWg.Wait()
+						close(done)
+					}()
+
+					select {
+					case <-done:
+						// All lookups completed successfully
+						log.Printf("DNS Worker %d completed all lookups for domain %s", workerID, domain)
+					case <-time.After(lookupTimeout):
+						// Timeout occurred, but let's log what we have so far
+						log.Printf("DNS Worker %d partial timeout for domain %s, saving partial results", workerID, domain)
+					}
+
+					// Even if we had a timeout, proceed with saving what we have
+					// Find the file for this domain
+					filename := fmt.Sprintf("%s/%s.json", outputDir, strings.Replace(domain, ".", "_", -1))
+
+					// Get the file lock
+					fileLock := getFileLock(filename)
+					fileLock.Lock()
+					defer fileLock.Unlock()
+
+					// Update the file with DNS data
+					prettyJSON, err := json.MarshalIndent(info, "", "  ")
+					if err != nil {
+						log.Printf("DNS Worker %d error marshaling JSON: %v", workerID, err)
+						if err := msg.Nak(); err != nil {
+							log.Printf("DNS Worker %d error NAKing message: %v", workerID, err)
+						}
+						return
+					}
+
+					err = os.WriteFile(filename, prettyJSON, 0644)
+					if err != nil {
+						log.Printf("DNS Worker %d error writing result to file: %v", workerID, err)
+						if err := msg.Nak(); err != nil {
+							log.Printf("DNS Worker %d error NAKing message: %v", workerID, err)
+						}
+						return
+					}
+
+					// Log any lookup errors
+					if len(lookupErrors) > 0 {
+						for _, err := range lookupErrors {
+							log.Printf("DNS Worker %d lookup error: %v", workerID, err)
+						}
+					}
+
+					// Publish to WHOIS stream
+					_, err = js.Publish(whoisSubjectName, prettyJSON)
+					if err != nil {
+						log.Printf("DNS Worker %d error publishing to WHOIS stream: %v", workerID, err)
+						if err := msg.Nak(); err != nil {
+							log.Printf("DNS Worker %d error NAKing message: %v", workerID, err)
+						}
+						return
+					}
+
+					// Acknowledge the message
+					if err := msg.Ack(); err != nil {
+						log.Printf("DNS Worker %d error acknowledging message: %v", workerID, err)
+					}
+
+					// Update DNS processed count
+					statusMutex.Lock()
+					domainsDNSProcessed++
+					statusMutex.Unlock()
+				}(msg)
 			}
-			log.Printf("Saved result to file: %s", filename)
+			wg.Wait()
 		}
 	}
-}
-
-// countFilesInDirectory counts files in a directory for total files completed stat
-func countFilesInDirectory(dir string) (int, error) {
-	files, err := os.ReadDir(dir)
-	if err != nil {
-		// If directory doesn't exist yet, return 0
-		if os.IsNotExist(err) {
-			return 0, nil
-		}
-		return 0, err
-	}
-	return len(files), nil
-}
-
-// displayLiveStats shows statistics with live updates until user presses a key
-func displayLiveStats(ctx context.Context) {
-	reader := bufio.NewReader(os.Stdin)
-
-	// Make stdin non-blocking
-	makeStdinNonBlocking()
-	defer makeStdinBlocking()
-
-	clearScreen()
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			// Clear only the stats portion, not the header
-			moveCursorUp(6) // Move up to clear previous stats
-
-			// Get the actual count of completed domains by counting files
-			completedCount, err := countFilesInDirectory(outputDir)
-			if err != nil {
-				completedCount = 0
-				log.Printf("Error counting completed files: %v", err)
-			}
-
-			stateMutex.Lock()
-			status := "STOPPED"
-			if isRunning {
-				status = "RUNNING"
-			}
-
-			fmt.Printf("\r\033[K========= Domain Processing Status [%s] =========\n", status)
-			fmt.Printf("\r\033[KTotal domains queued: %d\n", totalQueued)
-			fmt.Printf("\r\033[KCurrently processing: %d\n", processing)
-			fmt.Printf("\r\033[KCompleted: %d\n", completedCount)
-			fmt.Printf("\r\033[KOutput directory: %s\n", outputDir)
-			fmt.Printf("\r\033[K=============================================\n")
-			fmt.Printf("Press any key to return to menu...")
-			stateMutex.Unlock()
-		default:
-			// Check if key was pressed
-			if hasKeyboardInput() {
-				reader.ReadString('\n') // Clear the input
-				return
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-	}
-}
-
-// makeStdinNonBlocking configures terminal for non-blocking input
-func makeStdinNonBlocking() {
-	// Only for Unix-like systems
-	if runtime.GOOS != "windows" {
-		exec.Command("stty", "-F", "/dev/tty", "cbreak", "min", "1").Run()
-		exec.Command("stty", "-F", "/dev/tty", "-echo").Run()
-	}
-}
-
-// makeStdinBlocking restores terminal settings
-func makeStdinBlocking() {
-	// Only for Unix-like systems
-	if runtime.GOOS != "windows" {
-		exec.Command("stty", "-F", "/dev/tty", "echo").Run()
-	}
-}
-
-// hasKeyboardInput checks if there's input waiting on stdin
-func hasKeyboardInput() bool {
-	if runtime.GOOS == "windows" {
-		// Windows doesn't support non-blocking stdin easily
-		// Timeout approach
-		c := make(chan struct{})
-		go func() {
-			var b [1]byte
-			os.Stdin.Read(b[:])
-			close(c)
-		}()
-
-		select {
-		case <-c:
-			return true
-		case <-time.After(10 * time.Millisecond):
-			return false
-		}
-	} else {
-		var readfds unix.FdSet
-		fd := int(os.Stdin.Fd())
-		readfds.Set(fd)
-
-		// Zero timeout for non-blocking
-		timeout := &unix.Timeval{
-			Sec:  0,
-			Usec: 0,
-		}
-
-		n, err := unix.Select(fd+1, &readfds, nil, nil, timeout)
-		return err == nil && n > 0 && readfds.IsSet(fd)
-	}
-}
-
-// moveCursorUp moves cursor up n lines
-func moveCursorUp(n int) {
-	fmt.Printf("\033[%dA", n)
-}
-
-// runUserInterface handles user input for controlling the application
-func runUserInterface(ctx context.Context, cancel context.CancelFunc) {
-	reader := bufio.NewReader(os.Stdin)
-
-	// Clear screen and show initial menu
-	clearScreen()
-
-	for {
-		displayMenu()
-
-		input, err := reader.ReadString('\n')
-		if err != nil {
-			fmt.Printf("Error reading input: %v\n", err)
-			continue
-		}
-
-		input = strings.TrimSpace(input)
-
-		switch input {
-		case "1":
-			// Start domain aggregation
-			stateMutex.Lock()
-			isRunning = true
-			stateMutex.Unlock()
-			clearScreen()
-			fmt.Println("Domain aggregation STARTED")
-			time.Sleep(1 * time.Second)
-			clearScreen()
-
-		case "2":
-			// Stop domain aggregation
-			stateMutex.Lock()
-			isRunning = false
-			stateMutex.Unlock()
-			clearScreen()
-			fmt.Println("Domain aggregation STOPPED")
-			time.Sleep(1 * time.Second)
-			clearScreen()
-
-		case "3":
-			// Display live statistics
-			displayLiveStats(ctx)
-			clearScreen()
-
-		case "4":
-			// Quit application
-			clearScreen()
-			fmt.Println("Shutting down...")
-			cancel()
-			return
-
-		default:
-			clearScreen()
-			fmt.Println("Invalid option, please try again")
-			time.Sleep(1 * time.Second)
-			clearScreen()
-		}
-	}
-}
-
-// clearScreen clears the terminal screen
-func clearScreen() {
-	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
-		cmd = exec.Command("cmd", "/c", "cls")
-	} else {
-		cmd = exec.Command("clear")
-	}
-	cmd.Stdout = os.Stdout
-	cmd.Run()
-}
-
-// displayMenu shows the user interface menu
-func displayMenu() {
-	fmt.Println("\n========= Certstream-Scout =========")
-	fmt.Println("1. Start domain aggregation")
-	fmt.Println("2. Stop domain aggregation")
-	fmt.Println("3. View statistics")
-	fmt.Println("4. Quit")
-	fmt.Print("Enter your choice (1-4): ")
 }
 
 func main() {
-	// Parse cli flags
-	certstreamURLFlag := flag.String("certstream", certstreamURL, "Certstream WebSocket URL")
-	dnsServerFlag := flag.String("dns", dnsServer, "DNS server to use for lookups")
-	workersFlag := flag.Int("workers", numWorkers, "Number of worker goroutines")
-	natsURLFlag := flag.String("nats", natsURL, "NATS server URL")
-	cacheTTLFlag := flag.Duration("cache-ttl", cacheTTL, "Time to keep domains in cache (to avoid duplicates)")
-	outputDirFlag := flag.String("output-dir", outputDir, "Directory to store output files")
-
-	// WHOIS rate limiting flags
-	domainWhoisRateFlag := flag.Duration("domain-whois-rate", 500*time.Millisecond, "Time between domain WHOIS queries")
-	ipWhoisRateFlag := flag.Duration("ip-whois-rate", 1*time.Millisecond, "Time between IP WHOIS queries")
-	whoisCacheTTLFlag := flag.Duration("whois-cache-ttl", 7*24*time.Hour, "Time to keep WHOIS results in cache")
-
+	// Parse command line flags
 	flag.Parse()
+
+	// Create log directory
+	logDir := filepath.Join(outputDir, "logs")
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		log.Fatalf("Error creating log directory: %v", err)
+	}
+
+	// Redirect logs to file in the log directory
+	logPath := filepath.Join(logDir, "certstream-scout.log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		log.Fatalf("Error creating log file: %v", err)
+	}
+	defer logFile.Close()
+	log.SetOutput(logFile)
+
+	// Update output directory to use the main directory
+	outputDir = filepath.Join(outputDir, "data")
+
+	// Set up signal handling for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Set up signal handling
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		sig := <-sigChan
+		log.Printf("Received signal %v, initiating graceful shutdown", sig)
+		cancel()
+	}()
+
+	// Set up cleanup on exit
+	defer cleanup()
 
 	// Update vars based on flags
 	if *certstreamURLFlag != "" {
@@ -859,7 +1005,29 @@ func main() {
 	if *outputDirFlag != "" {
 		outputDir = *outputDirFlag
 	}
-	numWorkers := *workersFlag
+	dnsWorkers := *dnsWorkersFlag
+	whoisWorkers := *whoisWorkersFlag
+
+	// Parse WHOIS IPs
+	if *whoisIPsFlag != "" {
+		whoisWorkerIPs = strings.Split(*whoisIPsFlag, ",")
+		if len(whoisWorkerIPs) < whoisWorkers {
+			log.Printf("Warning: More WHOIS workers (%d) than IPs (%d). Some workers will share IPs.", whoisWorkers, len(whoisWorkerIPs))
+		}
+	} else {
+		log.Printf("No WHOIS IPs specified. Workers will use default system IP.")
+		whoisWorkerIPs = []string{""} // Empty string will use default system IP
+	}
+
+	// Initialize WHOIS worker configurations
+	for i := 0; i < whoisWorkers; i++ {
+		config := WHOISWorkerConfig{
+			IPAddress:     whoisWorkerIPs[i%len(whoisWorkerIPs)],
+			DomainLimiter: rate.NewLimiter(rate.Every(*domainWhoisRateFlag), 1),
+			IPLimiter:     rate.NewLimiter(rate.Every(*ipWhoisRateFlag), 1),
+		}
+		whoisWorkerConfigs = append(whoisWorkerConfigs, config)
+	}
 
 	// Update cache TTL if specified
 	if *cacheTTLFlag != cacheTTL {
@@ -868,53 +1036,19 @@ func main() {
 		domainCache = cache.New(cacheTTL, 1*time.Hour)
 	}
 
-	// Update WHOIS rate limiters if specified
-	if *domainWhoisRateFlag != 5*time.Second {
-		domainWhoisLimiter = rate.NewLimiter(rate.Every(*domainWhoisRateFlag), 1)
-	}
-	if *ipWhoisRateFlag != 10*time.Second {
-		ipWhoisLimiter = rate.NewLimiter(rate.Every(*ipWhoisRateFlag), 1)
-	}
-
 	// Update WHOIS cache TTL if specified
 	if *whoisCacheTTLFlag != 7*24*time.Hour {
 		whoisCache = cache.New(*whoisCacheTTLFlag, 1*time.Hour)
 	}
 
-	// Display initialization settings
-	fmt.Println("======================================================")
-	fmt.Println("Certstream-Scout initialized with the following settings:")
-	fmt.Println("------------------------------------------------------")
-	fmt.Printf("Certstream URL: %s\n", certstreamURL)
-	fmt.Printf("DNS Server: %s\n", dnsServer)
-	fmt.Printf("NATS Server: %s\n", natsURL)
-	fmt.Printf("Number of Workers: %d\n", numWorkers)
-	fmt.Printf("Output Directory: %s\n", outputDir)
-	fmt.Printf("Domain Cache TTL: %s\n", cacheTTL)
-	fmt.Printf("Domain WHOIS Rate: 1 query per %v\n", domainWhoisLimiter.Limit())
-	fmt.Printf("IP WHOIS Rate: 1 query per %v\n", ipWhoisLimiter.Limit())
-	fmt.Printf("WHOIS Cache TTL: %s\n", *whoisCacheTTLFlag)
-	fmt.Println("======================================================")
-	fmt.Println("Press any key to continue...")
-
-	// Wait for any key press before proceeding
-	makeStdinNonBlocking()
-	bufio.NewReader(os.Stdin).ReadByte()
-	makeStdinBlocking()
-
 	// Initialize random seed for jitter
 	rand.Seed(time.Now().UnixNano())
 
-	// Redirect logs to file at this point (before NATS connection)
-	logFile, err := os.OpenFile("certstream-scout.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-	if err == nil {
-		log.SetOutput(logFile)
-		defer logFile.Close()
-	} else {
-		fmt.Println("Warning: Could not create log file, logs will appear in console")
-		fmt.Println("Press Enter to continue anyway...")
-		bufio.NewReader(os.Stdin).ReadString('\n')
-	}
+	// Set running state based on auto-start flag
+	stateMutex.Lock()
+	isRunning = true    // Always start running
+	isCollecting = true // Always start collecting
+	stateMutex.Unlock()
 
 	// Connect to NATS
 	nc, err := nats.Connect(natsURL)
@@ -929,40 +1063,55 @@ func main() {
 		log.Fatalf("Failed to create JetStream context: %v", err)
 	}
 
-	// Delete existing stream if it exists
-	err = js.DeleteStream(streamName)
-	if err != nil && err != nats.ErrStreamNotFound {
-		log.Fatalf("Failed to delete existing stream: %v", err)
+	// Create streams
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:     "certstream",
+		Subjects: []string{"certstream.domains"},
+		Storage:  nats.FileStorage,
+		MaxAge:   24 * time.Hour,
+		Replicas: 1,
+	})
+	if err != nil && !strings.Contains(err.Error(), "stream name already in use") {
+		log.Printf("Warning: Failed to create certstream stream: %v", err)
 	}
 
-	// Create new stream with WorkQueuePolicy
 	_, err = js.AddStream(&nats.StreamConfig{
-		Name:      streamName,
-		Subjects:  []string{subjectName},
-		Storage:   nats.FileStorage,
-		Retention: nats.WorkQueuePolicy,
-		MaxAge:    30 * 24 * time.Hour, // Keep unconsumed data for up to 30 days
-		Replicas:  1,
+		Name:     "whois",
+		Subjects: []string{"certstream.whois"},
+		Storage:  nats.FileStorage,
+		MaxAge:   24 * time.Hour,
+		Replicas: 1,
+	})
+	if err != nil && !strings.Contains(err.Error(), "stream name already in use") {
+		log.Printf("Warning: Failed to create WHOIS stream: %v", err)
+	}
+
+	// Delete any existing consumers
+	if err := js.DeleteConsumer("certstream", consumerGroup); err != nil && err != nats.ErrConsumerNotFound {
+		log.Printf("Warning: Failed to delete existing consumer: %v", err)
+	}
+
+	// Create new consumer for DNS workers
+	_, err = js.AddConsumer("certstream", &nats.ConsumerConfig{
+		Durable:       consumerGroup,
+		AckPolicy:     nats.AckExplicitPolicy,
+		MaxDeliver:    3,
+		FilterSubject: "certstream.domains",
 	})
 	if err != nil {
-		log.Fatalf("Failed to create stream: %v", err)
+		log.Printf("Warning: Failed to create consumer: %v", err)
 	}
 
-	// Create a cancellable context
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Signal handling
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt)
-	go func() {
-		<-sigChan
-		log.Println("Received interrupt, shutting down...")
-		cancel()
-	}()
-
-	// Channel for result communication
-	resultChan := make(chan DomainInfo, channelBufferSize)
+	// Create new consumer for WHOIS workers
+	_, err = js.AddConsumer("whois", &nats.ConsumerConfig{
+		Durable:       consumerGroup,
+		AckPolicy:     nats.AckExplicitPolicy,
+		MaxDeliver:    3,
+		FilterSubject: "certstream.whois",
+	})
+	if err != nil {
+		log.Printf("Warning: Failed to create WHOIS consumer: %v", err)
+	}
 
 	// Wait group for all workers
 	var wg sync.WaitGroup
@@ -977,37 +1126,190 @@ func main() {
 		}
 	}()
 
-	// Start DNS resolvers/workers
-	for i := 0; i < numWorkers; i++ {
+	// Start DNS workers
+	for i := 0; i < dnsWorkers; i++ {
 		wg.Add(1)
-		i := i
-		go func() {
+		go func(id int) {
 			defer wg.Done()
-			if err := dnsResolver(ctx, i, js, resultChan); err != nil {
-				log.Printf("Worker %d error: %v", i, err)
+			if err := dnsResolver(ctx, id, js); err != nil {
+				log.Printf("DNS Worker %d error: %v", id, err)
+				cancel() // Cancel all other workers on error
 			}
-		}()
+		}(i)
 	}
 
-	// Start result saver
-	wg.Add(1)
+	// Start WHOIS workers
+	for i := 0; i < whoisWorkers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			config := whoisWorkerConfigs[id%len(whoisWorkerConfigs)]
+			if err := whoisResolver(ctx, id, js, config); err != nil {
+				log.Printf("WHOIS Worker %d error: %v", id, err)
+				cancel() // Cancel all other workers on error
+			}
+		}(i)
+	}
+
+	// Start control menu in a goroutine
+	menuCtx, menuCancel := context.WithCancel(ctx)
 	go func() {
-		defer wg.Done()
-		if err := resultSaver(ctx, resultChan); err != nil {
-			log.Printf("Result saver error: %v", err)
-		}
+		controlMenu()
+		menuCancel()
 	}()
 
-	// Set initial state to stopped
-	stateMutex.Lock()
-	isRunning = false
-	stateMutex.Unlock()
-	clearScreen()
+	// Wait for menu to exit or context cancellation
+	select {
+	case <-menuCtx.Done():
+		// Menu exited, cancel everything
+		cancel()
+	case <-ctx.Done():
+		// Context cancelled, wait for workers
+	}
 
-	// Run user interface
-	runUserInterface(ctx, cancel)
+	// Wait for all workers to finish with a timeout
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
 
-	// Wait for all workers to finish after context is cancelled
-	wg.Wait()
-	fmt.Println("All workers have shut down. Application exiting.")
+	// Wait for workers to finish or timeout after 5 seconds
+	select {
+	case <-done:
+		log.Println("All workers finished gracefully")
+	case <-time.After(5 * time.Second):
+		log.Println("Timeout waiting for workers, forcing exit")
+	}
+
+	// Quick cleanup
+	log.Println("Performing quick cleanup...")
+	domainCache.Flush()
+	whoisCache.Flush()
+	log.Println("Cleanup complete")
+}
+
+// cleanup performs cleanup operations when the application exits
+func cleanup() {
+	// Quick cleanup is now handled in main()
+}
+
+// controlMenu provides a simple control menu for the user
+func controlMenu() {
+	reader := bufio.NewReader(os.Stdin)
+	clearScreen := func() {
+		fmt.Print("\033[H\033[2J") // ANSI escape code to clear screen
+	}
+
+	for {
+		clearScreen()
+		fmt.Println("Certstream-Scout Control Menu")
+		fmt.Println("1. Show Status (Live Updates)")
+		fmt.Println("2. Start/Resume Domain Collection")
+		fmt.Println("3. Stop/Pause Domain Collection")
+		fmt.Println("4. Exit")
+		fmt.Print("Enter choice (1-4): ")
+
+		// Create a channel to receive input
+		inputChan := make(chan string)
+		errChan := make(chan error)
+
+		// Start a goroutine to read input
+		go func() {
+			input, err := reader.ReadString('\n')
+			if err != nil {
+				errChan <- err
+				return
+			}
+			inputChan <- input
+		}()
+
+		// Wait for input with timeout
+		select {
+		case input := <-inputChan:
+			input = strings.TrimSpace(input)
+			if input == "" {
+				continue
+			}
+
+			clearScreen()
+			switch input {
+			case "1":
+				// Create a channel to receive updates
+				updateChan := make(chan struct{}, 1)
+				// Start a goroutine to update stats
+				go func() {
+					for {
+						select {
+						case <-updateChan:
+							return
+						default:
+							clearScreen()
+							statusMutex.Lock()
+							fmt.Println("Status (Live Updates - Press Enter to return to menu):")
+							fmt.Printf("Domains Collected: %d\n", domainsCollected)
+							fmt.Printf("Domains DNS Processed: %d\n", domainsDNSProcessed)
+							fmt.Printf("Domains WHOIS Processed: %d\n", domainsWHOISProcessed)
+							fmt.Printf("Domains Fully Processed (DNS + WHOIS): %d\n", domainsFullyProcessed)
+							fmt.Printf("Collection Status: %s\n", map[bool]string{true: "Running", false: "Paused"}[isCollecting])
+							statusMutex.Unlock()
+							time.Sleep(500 * time.Millisecond) // Update every 500ms
+						}
+					}
+				}()
+
+				// Wait for Enter key
+				reader.ReadString('\n')
+				updateChan <- struct{}{}
+				time.Sleep(100 * time.Millisecond) // Small delay to ensure last status update is shown
+			case "2":
+				statusMutex.Lock()
+				if !isCollecting {
+					isCollecting = true
+					stateMutex.Lock()
+					isRunning = true
+					stateMutex.Unlock()
+					fmt.Println("Domain collection started/resumed")
+				} else {
+					fmt.Println("Domain collection already running")
+				}
+				statusMutex.Unlock()
+				fmt.Println("\nPress Enter to continue...")
+				reader.ReadString('\n')
+			case "3":
+				statusMutex.Lock()
+				if isCollecting {
+					isCollecting = false
+					stateMutex.Lock()
+					isRunning = false
+					stateMutex.Unlock()
+					fmt.Println("Domain collection stopped/paused")
+				} else {
+					fmt.Println("Domain collection already stopped")
+				}
+				statusMutex.Unlock()
+				fmt.Println("\nPress Enter to continue...")
+				reader.ReadString('\n')
+			case "4":
+				fmt.Println("Exiting...")
+				controlChan <- "exit"
+				return
+			default:
+				fmt.Println("Invalid choice. Please enter a number between 1 and 4.")
+				fmt.Println("\nPress Enter to continue...")
+				reader.ReadString('\n')
+			}
+		case err := <-errChan:
+			if err == io.EOF {
+				log.Println("Stdin closed, continuing in background mode")
+				return
+			}
+			log.Printf("Error reading input: %v", err)
+			time.Sleep(1 * time.Second) // Prevent tight loop on error
+		case <-time.After(5 * time.Second):
+			// If no input received within 5 seconds, continue in background mode
+			log.Println("No input received, continuing in background mode")
+			return
+		}
+	}
 }
