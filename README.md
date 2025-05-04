@@ -30,7 +30,7 @@ cd certstream-scout
 cp .env.example .env
 
 # Build and start container images
-docker-compose up -d build
+docker-compose up --build -d
 
 # Access Certstream-Scout menu
 docker-compose run --rm certstream-scout
