@@ -37,7 +37,7 @@ docker-compose up --build -d && docker-compose run --rm certstream-scout
 
 ### Environment Variables
 
-You can configure the application using environment variables in a `.env` file or directly in `docker-compose.yml`. Here are all available options:
+You can configure the application using environment variables in a `.env` file. The options available are:
 
 ```bash
 # Certstream and NATS Configuration
