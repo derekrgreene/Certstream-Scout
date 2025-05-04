@@ -29,10 +29,7 @@ cd certstream-scout
 # Create a .env file with your configuration (see example .env.example)
 cp .env.example .env
 
-# Build and start container images
-docker-compose up --build -d
-
-# Access Certstream-Scout menu
+# Build and start Certstream-Scout
 docker-compose run --rm certstream-scout
 ```
 
