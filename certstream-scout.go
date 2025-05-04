@@ -1210,106 +1210,90 @@ func controlMenu() {
 		fmt.Println("4. Exit")
 		fmt.Print("Enter choice (1-4): ")
 
-		// Create a channel to receive input
-		inputChan := make(chan string)
-		errChan := make(chan error)
-
-		// Start a goroutine to read input
-		go func() {
-			input, err := reader.ReadString('\n')
-			if err != nil {
-				errChan <- err
-				return
-			}
-			inputChan <- input
-		}()
-
-		// Wait for input with timeout
-		select {
-		case input := <-inputChan:
-			input = strings.TrimSpace(input)
-			if input == "" {
-				continue
-			}
-
-			clearScreen()
-			switch input {
-			case "1":
-				// Create a channel to receive updates
-				updateChan := make(chan struct{}, 1)
-				// Start a goroutine to update stats
-				go func() {
-					for {
-						select {
-						case <-updateChan:
-							return
-						default:
-							clearScreen()
-							statusMutex.Lock()
-							fmt.Println("Status (Live Updates - Press Enter to return to menu):")
-							fmt.Printf("Domains Collected: %d\n", domainsCollected)
-							fmt.Printf("Domains DNS Processed: %d\n", domainsDNSProcessed)
-							fmt.Printf("Domains WHOIS Processed: %d\n", domainsWHOISProcessed)
-							fmt.Printf("Domains Fully Processed (DNS + WHOIS): %d\n", domainsFullyProcessed)
-							fmt.Printf("Collection Status: %s\n", map[bool]string{true: "Running", false: "Paused"}[isCollecting])
-							statusMutex.Unlock()
-							time.Sleep(500 * time.Millisecond) // Update every 500ms
-						}
-					}
-				}()
-
-				// Wait for Enter key
-				reader.ReadString('\n')
-				updateChan <- struct{}{}
-				time.Sleep(100 * time.Millisecond) // Small delay to ensure last status update is shown
-			case "2":
-				statusMutex.Lock()
-				if !isCollecting {
-					isCollecting = true
-					stateMutex.Lock()
-					isRunning = true
-					stateMutex.Unlock()
-					fmt.Println("Domain collection started/resumed")
-				} else {
-					fmt.Println("Domain collection already running")
-				}
-				statusMutex.Unlock()
-				fmt.Println("\nPress Enter to continue...")
-				reader.ReadString('\n')
-			case "3":
-				statusMutex.Lock()
-				if isCollecting {
-					isCollecting = false
-					stateMutex.Lock()
-					isRunning = false
-					stateMutex.Unlock()
-					fmt.Println("Domain collection stopped/paused")
-				} else {
-					fmt.Println("Domain collection already stopped")
-				}
-				statusMutex.Unlock()
-				fmt.Println("\nPress Enter to continue...")
-				reader.ReadString('\n')
-			case "4":
-				fmt.Println("Exiting...")
-				controlChan <- "exit"
-				return
-			default:
-				fmt.Println("Invalid choice. Please enter a number between 1 and 4.")
-				fmt.Println("\nPress Enter to continue...")
-				reader.ReadString('\n')
-			}
-		case err := <-errChan:
+		input, err := reader.ReadString('\n')
+		if err != nil {
 			if err == io.EOF {
 				log.Println("Stdin closed, continuing in background mode")
 				return
 			}
 			log.Printf("Error reading input: %v", err)
-			time.Sleep(1 * time.Second) // Prevent tight loop on error
-		case <-time.After(5 * time.Second):
-			// If no input received within 5 seconds, continue in background mode
-			log.Println("No input received, continuing in background mode")
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
+		input = strings.TrimSpace(input)
+		if input == "" {
+			continue
+		}
+
+		clearScreen()
+		switch input {
+		case "1":
+			// Create a channel to receive updates
+			updateChan := make(chan struct{})
+			// Start a goroutine to update stats
+			go func() {
+				ticker := time.NewTicker(500 * time.Millisecond)
+				defer ticker.Stop()
+
+				for {
+					select {
+					case <-updateChan:
+						return
+					case <-ticker.C:
+						clearScreen()
+						statusMutex.Lock()
+						fmt.Println("Status (Live Updates - Press Enter to return to menu):")
+						fmt.Printf("Domains Collected: %d\n", domainsCollected)
+						fmt.Printf("Domains DNS Processed: %d\n", domainsDNSProcessed)
+						fmt.Printf("Domains WHOIS Processed: %d\n", domainsWHOISProcessed)
+						fmt.Printf("Domains Fully Processed (DNS + WHOIS): %d\n", domainsFullyProcessed)
+						fmt.Printf("Collection Status: %s\n", map[bool]string{true: "Running", false: "Paused"}[isCollecting])
+						statusMutex.Unlock()
+					}
+				}
+			}()
+
+			// Wait for Enter key
+			reader.ReadString('\n')
+			close(updateChan)
+			time.Sleep(100 * time.Millisecond)
+		case "2":
+			statusMutex.Lock()
+			if !isCollecting {
+				isCollecting = true
+				stateMutex.Lock()
+				isRunning = true
+				stateMutex.Unlock()
+				fmt.Println("Domain collection started/resumed")
+			} else {
+				fmt.Println("Domain collection already running")
+			}
+			statusMutex.Unlock()
+			fmt.Println("\nPress Enter to continue...")
+			reader.ReadString('\n')
+		case "3":
+			statusMutex.Lock()
+			if isCollecting {
+				isCollecting = false
+				stateMutex.Lock()
+				isRunning = false
+				stateMutex.Unlock()
+				fmt.Println("Domain collection stopped/paused")
+			} else {
+				fmt.Println("Domain collection already stopped")
+			}
+			statusMutex.Unlock()
+			fmt.Println("\nPress Enter to continue...")
+			reader.ReadString('\n')
+		case "4":
+			fmt.Println("Exiting...")
+			controlChan <- "exit"
 			return
+		default:
+			fmt.Println("Invalid choice. Please enter a number between 1 and 4.")
+			fmt.Println("\nPress Enter to continue...")
+			reader.ReadString('\n')
 		}
 	}
 }
