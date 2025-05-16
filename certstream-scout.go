@@ -28,10 +28,11 @@ import (
 
 const (
 	pingInterval      = 30 * time.Second
-	numWorkers        = 50              // Number of worker goroutines for DNS/WHOIS resolution
+	numWorkers        = 500             // Number of worker goroutines for DNS/WHOIS resolution
 	dnsTimeout        = 5 * time.Second // Increased timeout for DNS queries
 	dnsRetries        = 3               // Number of retries for DNS queries
 	channelBufferSize = 10000           // Buffer for high throughput
+	batchInterval     = 1 * time.Hour   // Process domains in hourly batches
 )
 
 // WHOISWorkerConfig represents configuration for a WHOIS worker
@@ -192,8 +193,54 @@ func retryWhois(domain string, isIP bool, maxRetries int, config WHOISWorkerConf
 	return "", fmt.Errorf("exceeded maximum retries for WHOIS query: %w", err)
 }
 
+// BatchManager manages the hourly batch processing
+type BatchManager struct {
+	currentBatchStart time.Time
+	mutex             sync.Mutex
+	nextBatchStart    time.Time
+}
+
+// NewBatchManager creates a new batch manager
+func NewBatchManager() *BatchManager {
+	now := time.Now()
+	return &BatchManager{
+		currentBatchStart: now,
+		nextBatchStart:    now.Add(batchInterval), // Next batch starts exactly one hour from now
+	}
+}
+
+// ShouldProcessDomain checks if a domain should be processed in the current batch
+func (bm *BatchManager) ShouldProcessDomain() bool {
+	bm.mutex.Lock()
+	defer bm.mutex.Unlock()
+
+	now := time.Now()
+	// If we're past the next batch start time, start a new batch
+	if now.After(bm.nextBatchStart) {
+		bm.currentBatchStart = now
+		bm.nextBatchStart = now.Add(batchInterval) // Next batch starts exactly one hour from now
+		return true
+	}
+
+	return true
+}
+
+// IsNewBatch checks if we're in a new batch period
+func (bm *BatchManager) IsNewBatch() bool {
+	bm.mutex.Lock()
+	defer bm.mutex.Unlock()
+
+	now := time.Now()
+	if now.After(bm.nextBatchStart) {
+		bm.currentBatchStart = now
+		bm.nextBatchStart = now.Add(batchInterval) // Next batch starts exactly one hour from now
+		return true
+	}
+	return false
+}
+
 // certstreamClient connects to the certstream server and publishes domains to NATS message broker
-func certstreamClient(ctx context.Context, js nats.JetStreamContext) error {
+func certstreamClient(ctx context.Context, js nats.JetStreamContext, batchManager *BatchManager) error {
 	log.Println("Connecting to certstream server at", certstreamURL)
 
 	c, _, err := websocket.DefaultDialer.Dial(certstreamURL, nil)
@@ -240,6 +287,12 @@ func certstreamClient(ctx context.Context, js nats.JetStreamContext) error {
 			if !currentlyRunning {
 				log.Println("Processing paused, waiting...")
 				time.Sleep(500 * time.Millisecond)
+				continue
+			}
+
+			// Check if we should process domains in the current batch
+			if !batchManager.ShouldProcessDomain() {
+				time.Sleep(100 * time.Millisecond)
 				continue
 			}
 
@@ -717,8 +770,8 @@ func whoisResolver(ctx context.Context, workerID int, js nats.JetStreamContext, 
 				// Update WHOIS processed count
 				statusMutex.Lock()
 				domainsWHOISProcessed++
-				// Only increment fully processed if we have DNS records
-				if len(existingInfo.A) > 0 || len(existingInfo.AAAA) > 0 || len(existingInfo.MX) > 0 || len(existingInfo.TXT) > 0 || len(existingInfo.CAA) > 0 || existingInfo.SOA != "" {
+				// Only increment fully processed if we have both DNS and WHOIS data
+				if existingInfo.DomainWhois != "" || len(existingInfo.IPWhois) > 0 {
 					domainsFullyProcessed++
 				}
 				statusMutex.Unlock()
@@ -1116,13 +1169,83 @@ func main() {
 	// Wait group for all workers
 	var wg sync.WaitGroup
 
+	// Initialize batch manager
+	batchManager := NewBatchManager()
+
 	// Start certstream client
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := certstreamClient(ctx, js); err != nil {
+		if err := certstreamClient(ctx, js, batchManager); err != nil {
 			log.Printf("Certstream client error: %v", err)
 			cancel() // Cancel all other workers on error
+		}
+	}()
+
+	// Start batch cleanup goroutine
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(1 * time.Minute) // Check every minute
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if batchManager.IsNewBatch() {
+					log.Println("Starting new batch processing period")
+
+					// Clear the domain cache to start fresh
+					domainCache.Flush()
+
+					// Clear the WHOIS cache
+					whoisCache.Flush()
+
+					// Reset counters for the new batch
+					statusMutex.Lock()
+					domainsCollected = 0
+					domainsDNSProcessed = 0
+					domainsWHOISProcessed = 0
+					domainsFullyProcessed = 0
+					statusMutex.Unlock()
+
+					// Delete any existing consumers to clear the queue
+					if err := js.DeleteConsumer("certstream", consumerGroup); err != nil && err != nats.ErrConsumerNotFound {
+						log.Printf("Warning: Failed to delete existing consumer: %v", err)
+					}
+
+					// Create new consumer for DNS workers
+					_, err = js.AddConsumer("certstream", &nats.ConsumerConfig{
+						Durable:       consumerGroup,
+						AckPolicy:     nats.AckExplicitPolicy,
+						MaxDeliver:    3,
+						FilterSubject: "certstream.domains",
+					})
+					if err != nil {
+						log.Printf("Warning: Failed to create consumer: %v", err)
+					}
+
+					// Delete any existing WHOIS consumers
+					if err := js.DeleteConsumer("whois", consumerGroup); err != nil && err != nats.ErrConsumerNotFound {
+						log.Printf("Warning: Failed to delete existing WHOIS consumer: %v", err)
+					}
+
+					// Create new consumer for WHOIS workers
+					_, err = js.AddConsumer("whois", &nats.ConsumerConfig{
+						Durable:       consumerGroup,
+						AckPolicy:     nats.AckExplicitPolicy,
+						MaxDeliver:    3,
+						FilterSubject: "certstream.whois",
+					})
+					if err != nil {
+						log.Printf("Warning: Failed to create WHOIS consumer: %v", err)
+					}
+
+					log.Println("Batch cleanup completed, ready for new batch")
+				}
+			}
 		}
 	}()
 
@@ -1247,7 +1370,6 @@ func controlMenu() {
 						fmt.Printf("Domains Collected: %d\n", domainsCollected)
 						fmt.Printf("Domains DNS Processed: %d\n", domainsDNSProcessed)
 						fmt.Printf("Domains WHOIS Processed: %d\n", domainsWHOISProcessed)
-						fmt.Printf("Domains Fully Processed (DNS + WHOIS): %d\n", domainsFullyProcessed)
 						fmt.Printf("Collection Status: %s\n", map[bool]string{true: "Running", false: "Paused"}[isCollecting])
 						statusMutex.Unlock()
 					}
