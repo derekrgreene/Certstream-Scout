@@ -25,11 +25,8 @@ This tool opens a websocket connection to [Certstream Server Go](https://github.
 git clone https://github.com/derekrgreene/certstream-scout.git
 cd certstream-scout
 
-# Build container images
-docker-compose build
-
-# Start all services
-docker-compose up -d
+# Build and start container images in background
+docker-compose up --build -d
 ```
 
 ## ⚙️ Configuration
