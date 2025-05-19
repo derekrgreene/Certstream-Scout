@@ -830,6 +830,42 @@ func displayMenu() {
 	fmt.Print("Enter your choice (1-4): ")
 }
 
+// queuePurger periodically purges unprocessed domains from the JetStream queue
+func queuePurger(ctx context.Context, js nats.JetStreamContext) error {
+	log.Println("Queue purger starting - will purge unprocessed domains hourly")
+
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			// Purge all pending messages from the stream
+			log.Println("Purging unprocessed domains from queue")
+			err := js.PurgeStream(streamName)
+			if err != nil {
+				log.Printf("Error purging stream: %v", err)
+				continue
+			}
+			log.Println("Successfully purged unprocessed domains from queue")
+
+			// Update statistics
+			stateMutex.Lock()
+			processing = 0 // Reset processing count since we purged the queue
+			stateMutex.Unlock()
+
+			// Signal stats update
+			select {
+			case statsChan <- struct{}{}:
+			default:
+				// Channel already has an update pending
+			}
+		}
+	}
+}
+
 func main() {
 	// Parse cli flags
 	certstreamURLFlag := flag.String("certstream", certstreamURL, "Certstream WebSocket URL")
@@ -995,6 +1031,15 @@ func main() {
 		defer wg.Done()
 		if err := resultSaver(ctx, resultChan); err != nil {
 			log.Printf("Result saver error: %v", err)
+		}
+	}()
+
+	// Start queue purger
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := queuePurger(ctx, js); err != nil {
+			log.Printf("Queue purger error: %v", err)
 		}
 	}()
 

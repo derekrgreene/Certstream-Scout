@@ -2,7 +2,7 @@
 certstream-scout
 
 # Application results dir
-/ctlog_data/
+ctlog_data/
 
 # Log files
 *.log
