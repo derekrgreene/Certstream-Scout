@@ -2,28 +2,40 @@ FROM golang:1.21-alpine AS builder
 
 WORKDIR /app
 
-RUN apk add --no-cache git ca-certificates
+# Install build dependencies
+RUN apk add --no-cache git ca-certificates tzdata
 
+# Copy dependency files
 COPY go.mod go.sum* ./
-
 RUN go mod download
 
+# Copy source code and entrypoint script
 COPY . .
+RUN chmod +x /app/entrypoint.sh
 
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o certstream-scout .
+# Build the application
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -a -installsuffix cgo -o certstream-scout .
 
-FROM alpine:latest
+# Create data directory
+RUN mkdir -p /app/ctlog_data
+
+# Use Alpine image
+FROM alpine:3.19
 
 WORKDIR /app
 
-RUN apk --no-cache add ca-certificates tzdata
+# Install runtime dependencies
+RUN apk add --no-cache ca-certificates tzdata
 
+# Copy only the necessary files from builder
 COPY --from=builder /app/certstream-scout /app/certstream-scout
+COPY --from=builder /app/entrypoint.sh /app/entrypoint.sh
+COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 
-RUN apk --no-cache add bash curl nano
+# Create the data directory & permissions
+RUN mkdir -p /app/ctlog_data && chmod 755 /app/ctlog_data
 
-RUN mkdir -p /app/ctlog_data
-
-COPY entrypoint.sh /app/
-
-RUN chmod +x /app/entrypoint.sh
+ENV TZ=UTC
+EXPOSE 8080
+ENTRYPOINT ["/app/entrypoint.sh"]
