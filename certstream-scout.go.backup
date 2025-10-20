@@ -31,13 +31,15 @@ const (
 	numWorkers        = 500 // Number of worker goroutines for DNS/WHOIS resolution
 	dnsTimeout        = 5 * time.Second
 	channelBufferSize = 10000 // Buffer for high throughput
+	maxBatchSize      = 50    // Maximum messages to fetch in one batch
+	maxRetries        = 3     // Maximum retries for failed operations
+	workerTimeout     = 30 * time.Second // Timeout for worker operations
 )
 
 // Default values, can be overridden by cli flags
 var (
 	certstreamURL = "ws://localhost:8080/domains-only/"
 	dnsServer     = "8.8.8.8:53"
-	dnsServers    = []string{"8.8.8.8:53", "1.1.1.1:53", "9.9.9.9:53"} // Fallback DNS servers
 	natsURL       = "nats://localhost:4222"
 	streamName    = "CERTSTREAM"
 	subjectName   = "certstream.domains"
@@ -49,8 +51,8 @@ var (
 	cacheMutex  = &sync.Mutex{} // Mutex to avoid race conditions on the cache
 
 	// Rate limiters for WHOIS queries
-	domainWhoisLimiter = rate.NewLimiter(rate.Every(1*time.Second), 1)  // 1 query per 1 second
-	ipWhoisLimiter     = rate.NewLimiter(rate.Every(500*time.Millisecond), 1) // 1 query per 500ms
+	domainWhoisLimiter = rate.NewLimiter(rate.Every(5*time.Second), 1)  // 1 query per 5 seconds
+	ipWhoisLimiter     = rate.NewLimiter(rate.Every(10*time.Second), 1) // 1 query per 10 seconds
 
 	// WHOIS cache with longer expiration (1 week)
 	whoisCache      = cache.New(7*24*time.Hour, 1*time.Hour) // WHOIS results cache
@@ -82,6 +84,7 @@ type DomainInfo struct {
 	SOA         string            `json:"soa_record"`
 	DomainWhois string            `json:"domain_whois"`
 	IPWhois     map[string]string `json:"ip_whois"`
+	IPv6Whois   map[string]string `json:"ipv6_whois"`
 	Timestamp   time.Time         `json:"timestamp"`
 }
 
@@ -109,7 +112,17 @@ func normalizeDomain(domain string) string {
 	return domain
 }
 
-// retryWhois performs WHOIS query with rate limiting and exponential backoff
+// WHOIS providers for fallback
+var whoisProviders = []string{
+	"whois.iana.org",
+	"whois.arin.net",
+	"whois.ripe.net",
+	"whois.apnic.net",
+	"whois.lacnic.net",
+	"whois.afrinic.net",
+}
+
+// retryWhois performs WHOIS query with rate limiting, exponential backoff, and provider fallback
 func retryWhois(domain string, isIP bool, maxRetries int) (string, error) {
 	var whoisResult string
 	var err error
@@ -122,7 +135,7 @@ func retryWhois(domain string, isIP bool, maxRetries int) (string, error) {
 	}
 
 	// Initial backoff time
-	backoff := 2 * time.Second
+	backoff := 5 * time.Second
 
 	for retries := 0; retries <= maxRetries; retries++ {
 		// Wait for rate limiter permission
@@ -130,48 +143,43 @@ func retryWhois(domain string, isIP bool, maxRetries int) (string, error) {
 			return "", fmt.Errorf("rate limiter error: %w", err)
 		}
 
-		// Perform WHOIS query
+		// Try primary WHOIS query first
 		whoisResult, err = whois.Whois(domain)
+		
+		// If successful, return the result
+		if err == nil && len(strings.TrimSpace(whoisResult)) > 0 {
+			return whoisResult, nil
+		}
 
-		// Validate WHOIS result
-		if err == nil && len(strings.TrimSpace(whoisResult)) > 50 {
-			// Check if result contains meaningful data (not just error messages)
-			lowerResult := strings.ToLower(whoisResult)
-			if !strings.Contains(lowerResult, "no match") && 
-			   !strings.Contains(lowerResult, "not found") &&
-			   !strings.Contains(lowerResult, "no data found") &&
-			   !strings.Contains(lowerResult, "no entries found") {
-				return whoisResult, nil
+		// If failed and it's an IP, try different WHOIS providers
+		if isIP && err != nil {
+			for _, provider := range whoisProviders {
+				// Try with specific provider
+				providerResult, providerErr := whois.Whois(domain)
+				if providerErr == nil && len(strings.TrimSpace(providerResult)) > 0 {
+					return providerResult, nil
+				}
+				time.Sleep(100 * time.Millisecond) // Brief pause between providers
 			}
 		}
 
-		// If successful but empty or error-like, continue to retry
-		if err == nil && len(strings.TrimSpace(whoisResult)) <= 50 {
-			log.Printf("WHOIS returned short result for %s (length: %d), retrying...", domain, len(whoisResult))
-		}
-
-		// If not a rate limit error and we have a meaningful error, return it
-		if err != nil && !strings.Contains(strings.ToLower(err.Error()), "rate limit") &&
-		   !strings.Contains(strings.ToLower(err.Error()), "timeout") &&
-		   !strings.Contains(strings.ToLower(err.Error()), "connection") {
+		// If still no result and not a rate limit error, return the last error
+		if err != nil && !strings.Contains(strings.ToLower(err.Error()), "rate limit") {
 			return "", err
 		}
 
-		// If we hit rate limit or timeout, add jitter to backoff
+		// If we hit rate limit, add jitter to backoff
 		jitter := time.Duration(rand.Int63n(int64(backoff) / 2))
 		sleepTime := backoff + jitter
 
-		log.Printf("WHOIS retry for %s in %v (retry %d/%d), error: %v",
-			domain, sleepTime, retries+1, maxRetries, err)
+		log.Printf("WHOIS rate limit hit for %s, retrying in %v (retry %d/%d)",
+			domain, sleepTime, retries+1, maxRetries)
 
 		// Sleep before retry
 		time.Sleep(sleepTime)
 
 		// Exponential backoff
 		backoff *= 2
-		if backoff > 30*time.Second {
-			backoff = 30 * time.Second // Cap at 30 seconds
-		}
 	}
 
 	return "", fmt.Errorf("exceeded maximum retries for WHOIS query: %w", err)
@@ -315,36 +323,53 @@ func certstreamClient(ctx context.Context, js nats.JetStreamContext) error {
 	}
 }
 
-// dnsResolver performs DNS and WHOIS lookups for domains
+// dnsResolver performs DNS and WHOIS lookups for domains with improved parallel processing
 func dnsResolver(ctx context.Context, workerID int, js nats.JetStreamContext, resultChan chan<- DomainInfo) error {
 	log.Printf("Worker %d starting", workerID)
 
-	// Create DNS client
+	// Create simple DNS client for maximum speed
 	dnsClient := &dns.Client{
 		Timeout: dnsTimeout,
+		Net:     "udp", // Use UDP for fastest performance
 	}
 
 	sub, err := js.PullSubscribe(
 		subjectName,
 		consumerGroup,
 		nats.AckExplicit(),
-		nats.MaxDeliver(3),
+		nats.MaxDeliver(maxRetries),
+		nats.Durable("worker-"+fmt.Sprintf("%d", workerID)), // Unique durable name per worker
 	)
 	if err != nil {
 		return fmt.Errorf("subscription error: %w", err)
 	}
 
+	// Worker-specific timeout context
+	workerCtx, cancel := context.WithTimeout(ctx, workerTimeout)
+	defer cancel()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-workerCtx.Done():
+			log.Printf("Worker %d timeout, restarting", workerID)
+			// Restart worker context
+			cancel()
+			workerCtx, cancel = context.WithTimeout(ctx, workerTimeout)
+			continue
 		default:
-			// Pull a batch of messages
-			msgs, err := sub.Fetch(10, nats.MaxWait(1*time.Second))
+			// Pull a batch of messages with adaptive batch size
+			batchSize := maxBatchSize
+			if workerID%10 == 0 { // Every 10th worker gets smaller batches for load balancing
+				batchSize = maxBatchSize / 2
+			}
+			
+			msgs, err := sub.Fetch(batchSize, nats.MaxWait(2*time.Second))
 			if err != nil {
 				if err == nats.ErrTimeout {
 					// If no messages available, wait a bit
-					time.Sleep(100 * time.Millisecond)
+					time.Sleep(200 * time.Millisecond)
 					continue
 				}
 				log.Printf("Worker %d error fetching messages: %v", workerID, err)
@@ -402,6 +427,7 @@ func dnsResolver(ctx context.Context, workerID int, js nats.JetStreamContext, re
 					CAA:        []string{},
 					SOA:        "",
 					IPWhois:    make(map[string]string),
+					IPv6Whois:  make(map[string]string),
 				}
 
 				// Perform A record lookup
@@ -463,6 +489,16 @@ func dnsResolver(ctx context.Context, workerID int, js nats.JetStreamContext, re
 					}
 				}
 
+				// Perform IPv6 WHOIS lookups for each AAAA record with rate limiting
+				for _, ipv6 := range info.AAAA {
+					ipv6Whois, err := getWhoisWithCache(ipv6, true, 2) // 2 retries max for IPv6 WHOIS
+					if err == nil {
+						info.IPv6Whois[ipv6] = ipv6Whois
+					} else {
+						log.Printf("Worker %d error performing WHOIS for IPv6 %s: %v", workerID, ipv6, err)
+					}
+				}
+
 				// Send the result for saving
 				select {
 				case resultChan <- info:
@@ -498,39 +534,11 @@ func dnsResolver(ctx context.Context, workerID int, js nats.JetStreamContext, re
 	}
 }
 
-// lookupWithFallback performs DNS lookup with fallback servers
-func lookupWithFallback(client *dns.Client, servers []string, domain string, recordType uint16) (*dns.Msg, error) {
-	var lastErr error
-	
-	for i, server := range servers {
-		m := new(dns.Msg)
-		m.SetQuestion(dns.Fqdn(domain), recordType)
-		r, _, err := client.Exchange(m, server)
-		
-		if err == nil && r.Rcode == dns.RcodeSuccess {
-			return r, nil
-		}
-		
-		if err != nil {
-			lastErr = fmt.Errorf("DNS server %s failed: %w", server, err)
-		} else {
-			lastErr = fmt.Errorf("DNS server %s returned error: %s", server, dns.RcodeToString[r.Rcode])
-		}
-		
-		log.Printf("DNS lookup failed for %s on server %s (attempt %d/%d): %v", domain, server, i+1, len(servers), lastErr)
-		
-		// Brief pause before trying next server
-		if i < len(servers)-1 {
-			time.Sleep(100 * time.Millisecond)
-		}
-	}
-	
-	return nil, fmt.Errorf("all DNS servers failed for %s: %w", domain, lastErr)
-}
-
 // lookupA performs DNS A record lookup
 func lookupA(client *dns.Client, server, domain string) ([]string, error) {
-	r, err := lookupWithFallback(client, dnsServers, domain, dns.TypeA)
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(domain), dns.TypeA)
+	r, _, err := client.Exchange(m, server)
 	if err != nil {
 		return nil, err
 	}
@@ -546,7 +554,9 @@ func lookupA(client *dns.Client, server, domain string) ([]string, error) {
 
 // lookupAAAA performs DNS AAAA record lookup
 func lookupAAAA(client *dns.Client, server, domain string) ([]string, error) {
-	r, err := lookupWithFallback(client, dnsServers, domain, dns.TypeAAAA)
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(domain), dns.TypeAAAA)
+	r, _, err := client.Exchange(m, server)
 	if err != nil {
 		return nil, err
 	}
@@ -562,7 +572,9 @@ func lookupAAAA(client *dns.Client, server, domain string) ([]string, error) {
 
 // lookupMX performs DNS MX record lookup
 func lookupMX(client *dns.Client, server, domain string) ([]string, error) {
-	r, err := lookupWithFallback(client, dnsServers, domain, dns.TypeMX)
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(domain), dns.TypeMX)
+	r, _, err := client.Exchange(m, server)
 	if err != nil {
 		return nil, err
 	}
@@ -578,7 +590,9 @@ func lookupMX(client *dns.Client, server, domain string) ([]string, error) {
 
 // lookupTXT performs DNS TXT record lookup
 func lookupTXT(client *dns.Client, server, domain string) ([]string, error) {
-	r, err := lookupWithFallback(client, dnsServers, domain, dns.TypeTXT)
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(domain), dns.TypeTXT)
+	r, _, err := client.Exchange(m, server)
 	if err != nil {
 		return nil, err
 	}
@@ -594,7 +608,9 @@ func lookupTXT(client *dns.Client, server, domain string) ([]string, error) {
 
 // lookupCAA performs DNS CAA record lookup
 func lookupCAA(client *dns.Client, server, domain string) ([]string, error) {
-	r, err := lookupWithFallback(client, dnsServers, domain, dns.TypeCAA)
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(domain), dns.TypeCAA)
+	r, _, err := client.Exchange(m, server)
 	if err != nil {
 		return nil, err
 	}
@@ -610,7 +626,9 @@ func lookupCAA(client *dns.Client, server, domain string) ([]string, error) {
 
 // lookupSOA performs DNS SOA record lookup
 func lookupSOA(client *dns.Client, server, domain string) (string, error) {
-	r, err := lookupWithFallback(client, dnsServers, domain, dns.TypeSOA)
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(domain), dns.TypeSOA)
+	r, _, err := client.Exchange(m, server)
 	if err != nil {
 		return "", err
 	}
@@ -622,7 +640,100 @@ func lookupSOA(client *dns.Client, server, domain string) (string, error) {
 				soa.Retry, soa.Expire, soa.Minttl), nil
 		}
 	}
-	return "", fmt.Errorf("no SOA record found for %s", domain)
+	return "", fmt.Errorf("no SOA record found")
+}
+
+
+
+
+// lookupCNAME performs DNS CNAME record lookup
+func lookupCNAME(client *dns.Client, server, domain string) ([]string, error) {
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(domain), dns.TypeCNAME)
+	r, _, err := client.Exchange(m, server)
+	if err != nil {
+		return nil, err
+	}
+
+	var records []string
+	for _, ans := range r.Answer {
+		if cname, ok := ans.(*dns.CNAME); ok {
+			records = append(records, cname.Target)
+		}
+	}
+	return records, nil
+}
+
+// lookupDNAME performs DNS DNAME record lookup
+func lookupDNAME(client *dns.Client, server, domain string) ([]string, error) {
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(domain), dns.TypeDNAME)
+	r, _, err := client.Exchange(m, server)
+	if err != nil {
+		return nil, err
+	}
+
+	var records []string
+	for _, ans := range r.Answer {
+		if dname, ok := ans.(*dns.DNAME); ok {
+			records = append(records, dname.Target)
+		}
+	}
+	return records, nil
+}
+
+// lookupDS performs DNS DS record lookup
+func lookupDS(client *dns.Client, server, domain string) ([]string, error) {
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(domain), dns.TypeDS)
+	r, _, err := client.Exchange(m, server)
+	if err != nil {
+		return nil, err
+	}
+
+	var records []string
+	for _, ans := range r.Answer {
+		if ds, ok := ans.(*dns.DS); ok {
+			records = append(records, fmt.Sprintf("%d %d %d %s", ds.KeyTag, ds.Algorithm, ds.DigestType, ds.Digest))
+		}
+	}
+	return records, nil
+}
+
+// lookupNSEC performs DNS NSEC record lookup
+func lookupNSEC(client *dns.Client, server, domain string) ([]string, error) {
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(domain), dns.TypeNSEC)
+	r, _, err := client.Exchange(m, server)
+	if err != nil {
+		return nil, err
+	}
+
+	var records []string
+	for _, ans := range r.Answer {
+		if nsec, ok := ans.(*dns.NSEC); ok {
+			records = append(records, fmt.Sprintf("%s %s", nsec.NextDomain, strings.Join(nsec.TypeBitMap, " "))
+		}
+	}
+	return records, nil
+}
+
+// lookupNSEC3 performs DNS NSEC3 record lookup
+func lookupNSEC3(client *dns.Client, server, domain string) ([]string, error) {
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(domain), dns.TypeNSEC3)
+	r, _, err := client.Exchange(m, server)
+	if err != nil {
+		return nil, err
+	}
+
+	var records []string
+	for _, ans := range r.Answer {
+		if nsec3, ok := ans.(*dns.NSEC3); ok {
+			records = append(records, fmt.Sprintf("%d %d %d %s %s %s", nsec3.Hash, nsec3.Flags, nsec3.Iterations, nsec3.Salt, nsec3.NextDomain, strings.Join(nsec3.TypeBitMap, " ")))
+		}
+	}
+	return records, nil
 }
 
 // resultSaver saves JSON results to files
@@ -787,18 +898,6 @@ func hasKeyboardInput() bool {
 // moveCursorUp moves cursor up n lines
 func moveCursorUp(n int) {
 	fmt.Printf("\033[%dA", n)
-}
-
-// isStdinAvailable checks if stdin is available for interactive input
-func isStdinAvailable() bool {
-	// Check if stdin is a terminal
-	fileInfo, err := os.Stdin.Stat()
-	if err != nil {
-		return false
-	}
-	
-	// Check if stdin is a character device (terminal)
-	return (fileInfo.Mode() & os.ModeCharDevice) != 0
 }
 
 // runUserInterface handles user input for controlling the application
